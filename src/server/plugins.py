@@ -844,6 +844,7 @@ class CronJob(BaseModel):
     command: str = ""   # 命令文本或消息内容
     enabled: bool = True
     task_type: str = "command"      # agent | command
+    prompt: str = ""                # agent 类型任务：到点要执行的任务描述
     timezone: str = "Asia/Shanghai"
     schedule_type: str | None = None  # hourly | daily | weekly | custom | scheduled(once)
     run_at: str | None = None       # 一次性任务（对齐 qwenpaw 的 once）：ISO8601 时间
@@ -866,6 +867,7 @@ def cron_add(job: CronJob):
         "command": job.command,
         "enabled": job.enabled,
         "task_type": job.task_type,
+        "prompt": job.prompt,
         "timezone": job.timezone,
         "schedule_type": schedule_type,
         "run_at": job.run_at,

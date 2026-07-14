@@ -1383,7 +1383,7 @@ function jobToForm(job: any): CronForm {
   f.enabled = job.enabled !== false;
   f.timezone = job.timezone || "Asia/Shanghai";
   f.taskType = job.task_type || "command";
-  f.content = job.command || "";
+  f.content = (job.task_type === "agent" ? job.prompt : job.command) || "";
 
   const scheduleType = job.schedule_type || "custom";
   const cron = (job.schedule || "").trim();
@@ -1478,16 +1478,23 @@ export function CronPanel() {
       return;
     }
     const { schedule, scheduleType } = serializeCron(form);
-    const payload = {
+    const content = form.content.trim();
+    const payload: any = {
       id: form.id,
       name: form.name.trim(),
       schedule,
-      command: form.content.trim(),
       enabled: form.enabled,
       task_type: form.taskType,
       timezone: form.timezone,
       schedule_type: scheduleType,
     };
+    if (form.taskType === "agent") {
+      payload.prompt = content;
+      payload.command = "";
+    } else {
+      payload.command = content;
+      payload.prompt = "";
+    }
     await apiFetch("/cron", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1522,6 +1529,7 @@ export function CronPanel() {
             <tr>
               <th>Job ID</th>
               <th>Job Name</th>
+              <th>Type</th>
               <th>Status</th>
               <th>Schedule Type</th>
               <th>Schedule (Cron)</th>
@@ -1529,9 +1537,9 @@ export function CronPanel() {
             </tr>
           </thead>
           <tbody>
-            {db.jobs.length === 0 && (
-              <tr>
-                <td colSpan={6}>
+              {db.jobs.length === 0 && (
+                <tr>
+                  <td colSpan={7}>
                   <div className="cron-empty">No data</div>
                 </td>
               </tr>
@@ -1540,6 +1548,11 @@ export function CronPanel() {
               <tr key={j.id}>
                 <td className="cron-id">{j.id}</td>
                 <td className="cron-name">{j.name}</td>
+                <td>
+                  <span className={"badge " + (j.task_type === "agent" ? "ok" : "off")}>
+                    {j.task_type === "agent" ? "Agent" : "Command"}
+                  </span>
+                </td>
                 <td>
                   <span className={"badge " + (j.enabled ? "ok" : "off")}>
                     {j.enabled ? "Enabled" : "Disabled"}
