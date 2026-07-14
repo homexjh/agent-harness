@@ -72,7 +72,9 @@ def make_context_node(context_manager: ContextManager, system_hint: str = None, 
         # 多用户隔离：运行时按当前 user 解析管理器。图在编译期按 (model,mode) 缓存，
         # 锁定的全局单例不能跨用户共享记忆/上下文，故此处按 config 里的 user_id 现取。
         # user_id 由 app 层在请求入口注入到 config["configurable"]。
-        from server.graph_provider import get_context_manager, get_memory_manager
+        # 注意：本项目以 src 为包根（start.sh 的 PYTHONPATH=项目根，uvicorn 跑 src.server.app），
+        # 故必须用相对导入 ..server，绝对 import server 在运行时解析不到（No module named 'server'）。
+        from ..server.graph_provider import get_context_manager, get_memory_manager
 
         cm = get_context_manager(user_id)
         mm = get_memory_manager(user_id)

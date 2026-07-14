@@ -716,7 +716,11 @@ export default function App() {
           streamingRef.current = null;
           break;
         case "done":
-          updateMsg(msgId, (m) => ({ ...m, status: m.status === "paused" ? m.status : "done" }));
+          // 不要覆盖已有的 error / paused 状态：
+          // 若后端在流式过程中报错（如 No module named 'server'），error 事件已把
+          // status 置为 error 并展示红字；done 事件若再覆盖成 done，错误会被抹掉，
+          // 气泡变成「(无内容)」让问题看起来像静默失败。paused（审批挂起）同理需保留。
+          updateMsg(msgId, (m) => ({ ...m, status: (m.status === "error" || m.status === "paused") ? m.status : "done" }));
           setStreaming(false);
           streamingRef.current = null;
           break;
