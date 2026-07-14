@@ -428,8 +428,10 @@ def get_config() -> RuntimeConfig:
 def save_config(partial: Dict[str, Any]) -> RuntimeConfig:
     """合并并持久化配置，版本号 +1。返回最新配置。"""
     global _instance
+    # 必须在持锁前读取当前配置：get_config() 在 _instance 为空时会获取 _lock，
+    # 若放在 with _lock 内部会触发非重入锁的自死锁（save_config 作为首个配置调用时必现）。
+    cur = asdict(get_config())
     with _lock:
-        cur = asdict(get_config())
         merged = _deep_merge(cur, partial)
         # 归一化：清理空字符串 api_key 时仍保留字段
         cfg = RuntimeConfig(**_normalize(merged))

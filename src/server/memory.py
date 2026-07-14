@@ -491,7 +491,8 @@ class MemoryManager:
         interval = self.cfg.reme_light_memory_config.auto_memory_interval or 0
         if interval <= 0 and not force:
             return
-        tid = thread_id or self._active_thread or "default"
+        # _active_thread 可能未设置（如直接以 force=True 调用时），用 getattr 兜底避免崩溃
+        tid = thread_id or getattr(self, "_active_thread", None) or "default"
         if not force:
             with self._lock:
                 self._turn_count[tid] = self._turn_count.get(tid, 0) + 1
