@@ -38,7 +38,7 @@ echo "==> Python: $($PYTHON --version 2>&1) | Node: $(node -v 2>&1)"
 
 # 清理旧实例：必须先杀掉端口 8123 上已有的后端，以及上一轮遗留的 vite 前端。
 # 否则每次启动都会新开一个 uvicorn，旧进程变孤儿并持续持有
-# ~/.workbuddy/checkpoints.sqlite —— 多实例共享同一 sqlite 会造成跨进程锁竞争，
+# ~/.agent-harness/checkpoints.sqlite —— 多实例共享同一 sqlite 会造成跨进程锁竞争，
 # 表现为聊天间歇性卡死（几十秒无响应）。这是历史卡顿的根因。
 echo "==> 清理已有实例（按端口/进程）..."
 for p in 8123 5173 5174 5175 5176 5177 5178 5179 5180 5181 5182 5183 5184 5185; do

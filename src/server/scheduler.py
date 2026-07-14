@@ -15,13 +15,15 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
+from .config import DATA_HOME
+
 # ---------------------------------------------------------------------------
-# 路径约定（与 plugins.py 保持一致）
+# 路径约定（与 plugins.py 一致，统一使用 agent-harness 独立数据目录 DATA_HOME）
 # ---------------------------------------------------------------------------
 def _workbuddy_dir() -> Path:
-    p = Path.home() / ".workbuddy"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    # 不再使用 ~/.workbuddy（那是 WorkBuddy IDE 的数据目录）
+    DATA_HOME.mkdir(parents=True, exist_ok=True)
+    return DATA_HOME
 
 
 def _workspace_dir() -> Path:

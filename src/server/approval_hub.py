@@ -9,7 +9,7 @@
 - 超时（``running.approval_timeout_seconds``，默认对齐 QwenPaw 300s）自动以 ``"rejected"``
   决议返回，**同一执行流**继续——与 QwenPaw「阻塞点原地 Future 超时」语义一致。
 - 前端批准/拒绝 → ``hub.resolve(request_id, decision)`` → ``future.set_result``，原图继续执行。
-- 多 worker 共享：pending 决议持久化到共享 SQLite（``~/.workbuddy/approvals.sqlite``）。
+- 多 worker 共享：pending 决议持久化到共享 SQLite（``DATA_HOME/approvals.sqlite``，即 ~/.agent-harness）。
   任一 worker 的后台 poller 都会扫描共享表：把跨 worker 的决议/超时落到本 worker 持有的
   future 上，从而多 worker 部署下审批也能正确解除（旧实现 ``_pending`` 是模块级 dict，
   完全不跨 worker）。
@@ -26,6 +26,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
+
+from .config import DATA_HOME
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +81,9 @@ class PendingApproval:
 # 共享 SQLite 存储（多 worker 安全网）
 # ---------------------------------------------------------------------------
 def _db_path() -> Path:
-    p = Path.home() / ".workbuddy" / "approvals.sqlite"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return p
+    # agent-harness 独立数据目录（不再使用 ~/.workbuddy，那是 WorkBuddy IDE 的数据目录）
+    DATA_HOME.mkdir(parents=True, exist_ok=True)
+    return DATA_HOME / "approvals.sqlite"
 
 
 def _conn() -> sqlite3.Connection:

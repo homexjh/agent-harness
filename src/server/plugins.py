@@ -1,6 +1,6 @@
 """插件/配件管理端点：Files、Tools、Skills、MCP、ACP、Agents、Cron、Heartbeat、Sessions。
 
-提供 QwenPaw 侧边栏所需的全部管理视图，数据持久化在 ~/.workbuddy/ 下。
+提供 QwenPaw 侧边栏所需的全部管理视图，数据持久化在独立目录 ~/.agent-harness/ 下（不再占用 ~/.workbuddy）。
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
+
+from .config import DATA_HOME
 from pydantic import BaseModel, Field
 
 from .graph_provider import get_context_manager, reset_context_manager
@@ -44,9 +46,9 @@ router = APIRouter(prefix="")
 # 目录约定
 # ---------------------------------------------------------------------------
 def _workbuddy_dir() -> Path:
-    p = Path.home() / ".workbuddy"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    # agent-harness 独立数据目录（不再使用 ~/.workbuddy，那是 WorkBuddy IDE 的数据目录）
+    DATA_HOME.mkdir(parents=True, exist_ok=True)
+    return DATA_HOME
 
 
 def _workspace_dir() -> Path:
@@ -451,7 +453,12 @@ def _scan_skill_dir(base: Path, scope: str) -> list[dict]:
 
 @router.get("/skills")
 def skills_list():
-    """扫描用户级和项目级技能目录，附带启用状态。"""
+    """扫描用户级和项目级技能目录，附带启用状态。
+
+    注意：项目级技能目录是仓库内的 ``.workbuddy/skills``（agent-harness 自带资产），
+    它位于项目根目录下，并非 WorkBuddy IDE 的全局数据目录 ``~/.workbuddy``，
+    因此不参与“数据目录独立化”迁移，保持原路径扫描。
+    """
     project = Path.cwd() / ".workbuddy" / "skills"
     user = _workbuddy_dir() / "skills"
     state = _skills_state()
@@ -948,7 +955,7 @@ def sessions_list():
     """返回最近活跃的会话列表（来自持久化的会话索引 sessions.json）。
 
     历史真相源是会话索引文件（开对话时由 _touch_session 维护），不再从 checkpointer
-    枚举——checkpoint 已落盘到 ~/.workbuddy/checkpoints.sqlite，由 get_shared_checkpointer 管理。
+    枚举——checkpoint 已落盘到 DATA_HOME/checkpoints.sqlite（~/.agent-harness），由 get_shared_checkpointer 管理。
     """
     threads = []
     idx = _db_path("sessions.json")

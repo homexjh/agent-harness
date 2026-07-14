@@ -11,7 +11,7 @@
 - ``max_tool_result_chars``：工具结果裁剪上限（QwenPaw 的 ToolResultPruningMiddleware 等效）；
   0 = 不裁剪。超出部分在上下文里截断，但原始全文仍保留在 store，recall 可还原。
 
-配置持久化到 ``~/.workbuddy/context_config.json``，与 memory_config.json 同目录。
+配置持久化到 ``DATA_HOME/context_config.json``（即 ~/.agent-harness），与 memory_config.json 同目录。
 """
 from __future__ import annotations
 
@@ -20,11 +20,13 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from .config import DATA_HOME
+
 
 def _workbuddy_dir() -> Path:
-    p = Path.home() / ".workbuddy"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    # agent-harness 独立数据目录（不再使用 ~/.workbuddy，那是 WorkBuddy IDE 的数据目录）
+    DATA_HOME.mkdir(parents=True, exist_ok=True)
+    return DATA_HOME
 
 
 CONFIG_PATH = _workbuddy_dir() / "context_config.json"

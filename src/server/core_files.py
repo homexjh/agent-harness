@@ -9,7 +9,7 @@ Manages the six markdown persona files in the workspace root:
   MEMORY.md    - long-term memory / tool settings notes
 
 The module also persists the list of enabled files and their ordering
-under ``~/.workbuddy/core_files_config.json``. The enabled files are
+under ``DATA_HOME/core_files_config.json`` (i.e. ~/.agent-harness). The enabled files are
 loaded in order and prepended to the system prompt sent to the model.
 """
 from __future__ import annotations
@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+from .config import DATA_HOME
 
 
 # ---------------------------------------------------------------------------
@@ -495,9 +497,9 @@ class CoreFilesConfig(BaseModel):
 # Paths
 # ---------------------------------------------------------------------------
 def _workbuddy_dir() -> Path:
-    p = Path.home() / ".workbuddy"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    # agent-harness 独立数据目录（不再使用 ~/.workbuddy，那是 WorkBuddy IDE 的数据目录）
+    DATA_HOME.mkdir(parents=True, exist_ok=True)
+    return DATA_HOME
 
 
 CONFIG_PATH = _workbuddy_dir() / "core_files_config.json"

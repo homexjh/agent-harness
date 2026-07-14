@@ -15,6 +15,15 @@ import {
 } from "./panels/Plugins";
 import { MemoryPanel } from "./panels/Memory";
 import { ContextPanel as ContextManagerPanel } from "./panels/Context";
+import {
+  ModelsPanel,
+  EnvsPanel,
+  SecurityPanel,
+  TokenUsagePanel,
+  BackupsPanel,
+  VoicePanel,
+  DebugPanel,
+} from "./panels/Settings";
 
 // ===========================================================================
 // Agent Harness · 全功能侧边栏导航 + 自研 SSE 信封
@@ -50,6 +59,13 @@ const ContextIcon = () => <Icon><polygon points="12 2 2 7 12 12 22 7 12 2" /><po
 const ConfigIcon = () => <Icon><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" /></Icon>;
 const StatsIcon = () => <Icon><line x1="18" y1="20" x2="18" y2="10" /><line x1="12" y1="20" x2="12" y2="4" /><line x1="6" y1="20" x2="6" y2="14" /></Icon>;
 const AgentsIcon = () => <Icon><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" /><line x1="12" y1="19" x2="12" y2="23" /><line x1="8" y1="23" x2="16" y2="23" /></Icon>;
+const ModelsIcon = () => <Icon><rect x="4" y="4" width="16" height="16" rx="2" /><rect x="9" y="9" width="6" height="6" /><line x1="9" y1="1" x2="9" y2="4" /><line x1="15" y1="1" x2="15" y2="4" /><line x1="9" y1="20" x2="9" y2="23" /><line x1="15" y1="20" x2="15" y2="23" /><line x1="20" y1="9" x2="23" y2="9" /><line x1="20" y1="14" x2="23" y2="14" /><line x1="1" y1="9" x2="4" y2="9" /><line x1="1" y1="14" x2="4" y2="14" /></Icon>;
+const EnvsIcon = () => <Icon><line x1="4" y1="21" x2="4" y2="14" /><line x1="4" y1="10" x2="4" y2="3" /><line x1="12" y1="21" x2="12" y2="12" /><line x1="12" y1="8" x2="12" y2="3" /><line x1="20" y1="21" x2="20" y2="16" /><line x1="20" y1="12" x2="20" y2="3" /><line x1="1" y1="14" x2="7" y2="14" /><line x1="9" y1="8" x2="15" y2="8" /><line x1="17" y1="16" x2="23" y2="16" /></Icon>;
+const SecurityIcon = () => <Icon><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></Icon>;
+const TokenUsageIcon = () => <Icon><line x1="18" y1="20" x2="18" y2="10" /><line x1="12" y1="20" x2="12" y2="4" /><line x1="6" y1="20" x2="6" y2="14" /></Icon>;
+const BackupsIcon = () => <Icon><polyline points="21 8 21 21 3 21 3 8" /><rect x="1" y="3" width="22" height="5" /><line x1="10" y1="12" x2="14" y2="12" /></Icon>;
+const VoiceIcon = () => <Icon><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" /><line x1="12" y1="19" x2="12" y2="23" /><line x1="8" y1="23" x2="16" y2="23" /></Icon>;
+const DebugIcon = () => <Icon><polyline points="4 17 10 11 4 5" /><line x1="12" y1="19" x2="20" y2="19" /></Icon>;
 
 const ICONS: Record<string, React.ReactNode> = {
   chat: <ChatIcon />,
@@ -67,6 +83,13 @@ const ICONS: Record<string, React.ReactNode> = {
   config: <ConfigIcon />,
   stats: <StatsIcon />,
   agents: <AgentsIcon />,
+  models: <ModelsIcon />,
+  envs: <EnvsIcon />,
+  security: <SecurityIcon />,
+  tokenusage: <TokenUsageIcon />,
+  backups: <BackupsIcon />,
+  voice: <VoiceIcon />,
+  debug: <DebugIcon />,
 };
 
 type ToolCall = {
@@ -955,9 +978,17 @@ export default function App() {
           </NavGroup>
 
           <NavGroup title="Settings">
+            <NavItem id="agents" label="Agent Management" active={view === "agents"} />
+            <NavItem id="models" label="Models" active={view === "models"} />
+            <NavItem id="skills" label="Skill Pool" active={view === "skills"} />
+            <NavItem id="envs" label="Environments" active={view === "envs"} />
+            <NavItem id="security" label="Security" active={view === "security"} />
+            <NavItem id="tokenusage" label="Token Usage" active={view === "tokenusage"} />
+            <NavItem id="backups" label="Backups" active={view === "backups"} />
+            <NavItem id="voice" label="Voice Transcription" active={view === "voice"} />
+            <NavItem id="debug" label="Debug" active={view === "debug"} />
             <NavItem id="config" label="Configuration" active={view === "config"} />
             <NavItem id="stats" label="Agent Statistics" active={view === "stats"} />
-            <NavItem id="agents" label="Agent Management" active={view === "agents"} />
           </NavGroup>
         </div>
 
@@ -1015,6 +1046,13 @@ export default function App() {
         {view === "memory" && <MemoryPanel />}
         {view === "context" && <ContextManagerPanel />}
         {view === "agents" && <AgentsPanel />}
+        {view === "models" && <ModelsPanel />}
+        {view === "envs" && <EnvsPanel />}
+        {view === "security" && <SecurityPanel />}
+        {view === "tokenusage" && <TokenUsagePanel />}
+        {view === "backups" && <BackupsPanel />}
+        {view === "voice" && <VoicePanel />}
+        {view === "debug" && <DebugPanel />}
         {view === "stats" && <StatsPanel metrics={metrics} />}
         {view === "config" && (
           <ConfigPanel

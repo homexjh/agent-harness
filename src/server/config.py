@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from cryptography.fernet import Fernet
@@ -33,6 +35,59 @@ def _repo_root() -> str:
 CONFIG_DIR = os.environ.get("AGENT_CONFIG_DIR", os.path.join(_repo_root(), "config"))
 CONFIG_PATH = os.path.join(CONFIG_DIR, "runtime.json")
 SECRET_PATH = os.path.join(CONFIG_DIR, ".config_secret")
+
+# ---------------------------------------------------------------------------
+# 独立数据目录
+# ---------------------------------------------------------------------------
+# agent-harness 的全部运行时数据不再写入 ~/.workbuddy（那是 WorkBuddy IDE 的数据目录，
+# 内含 IDE 的 skills/binaries/traces/logs 等），统一落到独立的 ~/.agent-harness。
+# 可用环境变量 AGENT_DATA_HOME 覆盖（容器/多实例场景）。
+DATA_HOME = Path(os.environ.get("AGENT_DATA_HOME", Path.home() / ".agent-harness"))
+
+# 仅迁移这些 agent-harness 自有文件/目录；绝不移动 IDE 的 skills/binaries/traces/logs/memory 等。
+# 注意：~/.workbuddy/skills 是 WorkBuddy IDE 的技能目录，不可迁移，agent-harness 的用户级技能已改指
+#       DATA_HOME/skills（见 plugins.py），两者彻底解耦。
+_MIGRATE_FILES = [
+    "cron.json", "cron_history.json", "mcp.json", "mcp-approvals.json",
+    "agents.json", "skills_state.json", "core_files_state.json", "tools_state.json",
+    "memory_config.json", "context_config.json", "core_files_config.json",
+    "workspace-state.json", "sessions.json", "token_usage.json", "security.json",
+    "voice.json", "envs.json", "approvals.sqlite", "checkpoints.sqlite",
+]
+_MIGRATE_DIRS = ["workspace", "backups", "sessions"]
+
+
+def migrate_from_workbuddy() -> None:
+    """首次启动把散落在 ~/.workbuddy 的 agent-harness 数据挪到独立目录 DATA_HOME。
+
+    仅迁移上面白名单中的 agent-harness 自有文件，绝不触碰 WorkBuddy IDE 的数据
+    （skills/binaries/traces/logs/memory/workbuddy.db 等）。幂等：已存在则跳过。
+    """
+    legacy = Path.home() / ".workbuddy"
+    if not legacy.exists():
+        return
+    DATA_HOME.mkdir(parents=True, exist_ok=True)
+    for name in _MIGRATE_FILES:
+        for suffix in ("", "-wal", "-shm"):
+            src = legacy / f"{name}{suffix}"
+            if src.exists():
+                dst = DATA_HOME / f"{name}{suffix}"
+                if not dst.exists():
+                    shutil.move(str(src), str(dst))
+    for d in _MIGRATE_DIRS:
+        src = legacy / d
+        if src.exists() and src.is_dir():
+            dst = DATA_HOME / d
+            dst.mkdir(parents=True, exist_ok=True)
+            for item in src.iterdir():
+                target = dst / item.name
+                if not target.exists():
+                    shutil.move(str(item), str(target))
+            try:
+                if not any(src.iterdir()):
+                    src.rmdir()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------

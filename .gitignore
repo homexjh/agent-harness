@@ -34,3 +34,6 @@ frontend/.env
 
 # Vite 临时配置产物
 vite.config.ts.timestamp-*.mjs
+
+# 运行时日志（agent-harness 项目自己的 logs 目录，非 ~/.workbuddy）
+logs/

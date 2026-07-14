@@ -31,14 +31,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from langchain_core.tools import StructuredTool
 
+from .config import DATA_HOME
+
 
 # ---------------------------------------------------------------------------
 # 路径约定（与 plugins.py / graph_provider.py 保持一致）
 # ---------------------------------------------------------------------------
 def _workbuddy_dir() -> Path:
-    p = Path.home() / ".workbuddy"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    # agent-harness 独立数据目录（不再使用 ~/.workbuddy，那是 WorkBuddy IDE 的数据目录）
+    DATA_HOME.mkdir(parents=True, exist_ok=True)
+    return DATA_HOME
 
 
 def _workspace_dir() -> Path:

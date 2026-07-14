@@ -25,6 +25,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Request
@@ -44,11 +45,12 @@ from .graph_provider import (
     init_shared_checkpointer,
 )
 from .sse_utils import interrupt_to_dict, jsonable, jsonable_state, sse, sse_comment
-from .config import get_config, save_config
+from .config import get_config, save_config, _repo_root, migrate_from_workbuddy
 from .auth import require_auth
 from .ratelimit import rate_limit
 from .model_discovery import discover_models, list_providers
 from .plugins import router as plugins_router, _touch_session
+from .settings_api import router as settings_router, apply_envs_on_startup
 from .scheduler import start_scheduler, stop_scheduler, set_agent_runner
 from .approval_hub import get_hub, set_emitter, clear_emitter
 
@@ -88,10 +90,20 @@ async def _pump_graph(graph, input_val, config, out_q: "asyncio.Queue") -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动后台定时任务调度器与审批中枢 poller，退出时关闭。"""
+    # 启动第一步：把旧版散落在 ~/.workbuddy 的 agent-harness 数据迁移到独立目录
+    # ~/.agent-harness。必须在 init_shared_checkpointer() 之前执行，否则会迁移一个
+    # 已被打开的 checkpoints.sqlite。
+    try:
+        migrate_from_workbuddy()
+    except Exception as e:
+        logger.warning("数据目录迁移失败（不影响启动）：%s", e)
     start_scheduler()
     _register_scheduler_agent_runner()
     get_hub().start_poller()
     await init_shared_checkpointer()
+    # 应用启动时把已保存的环境变量注入进程（供工具/子进程读取）
+    apply_envs_on_startup()
+    logger.info("Agent Harness 启动完成（已挂载设置中心路由 /settings/*，日志落盘 logs/agent-harness.log）")
     yield
     stop_scheduler()
 
@@ -157,13 +169,33 @@ def _push_notification(job: dict, text: str) -> None:
 
 app = FastAPI(title="Agent Harness API", version="0.1.0", lifespan=lifespan)
 app.include_router(plugins_router)
+app.include_router(settings_router)
 
 logger = logging.getLogger("agent_harness")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
+    fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s", datefmt="%H:%M:%S")
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s", datefmt="%H:%M:%S"))
+    handler.setFormatter(fmt)
     logger.addHandler(handler)
+    # 落盘日志：Debug 面板读取该文件末尾 N 行。RotatingFileHandler 防止无限膨胀，
+    # 且仅写文件、不阻塞请求路径（logging 内部有锁但写盘极快，对时延无感知影响）。
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        # 日志落在 agent-harness 项目自己的 logs/ 目录，避免污染 ~/.workbuddy（WorkBuddy IDE 数据目录）
+        _log_dir = Path(_repo_root()) / "logs"
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _fh = RotatingFileHandler(
+            _log_dir / "agent-harness.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        _fh.setFormatter(fmt)
+        logger.addHandler(_fh)
+    except Exception:
+        pass
     logger.propagate = False
 
 # CORS：前端 dev server (5173) 跨域访问 API (8123)。生产环境请收紧 origins。

@@ -47,6 +47,7 @@ from ..harness.security.guarded_tool import make_guarded_tools
 from ..harness.security.approval import ApprovalGate
 from ..harness.stability.observability import Metrics
 from .scheduler import schedule_one_time, sync_jobs
+from .config import DATA_HOME
 
 
 _ANSISTANT_MSG_PREFIX = "agent-harness exec"
@@ -69,8 +70,8 @@ def get_assistant_id() -> str:
 
 
 def _workspace_dir() -> Path:
-    """与 plugins.py 一致的工作区根目录：~/.workbuddy/workspace。"""
-    p = Path.home() / ".workbuddy" / "workspace"
+    """与 plugins.py 一致的工作区根目录：DATA_HOME/workspace（独立目录，非 ~/.workbuddy）。"""
+    p = DATA_HOME / "workspace"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -415,7 +416,7 @@ def _build_model():
     cfg = get_config()
     api_key = (cfg.llm.get("api_key") or "").strip()
     if api_key:
-        return make_deepseek_model(
+        model = make_deepseek_model(
             model=(cfg.llm.get("model") or "deepseek-chat").strip(),
             api_key=api_key,
             base_url=(cfg.llm.get("base_url") or None),
@@ -423,6 +424,20 @@ def _build_model():
             reasoning=bool(cfg.llm.get("reasoning", False)),
             provider=(cfg.llm.get("provider") or "").strip(),
         )
+        # 非阻塞 Token Usage 记录：回调只在 LLM 调用结束后抓取用量，
+        # 写盘动作在 daemon 线程执行，不影响流式响应时延。
+        try:
+            from .token_usage import TokenUsageCallbackHandler
+
+            model.callbacks = [
+                TokenUsageCallbackHandler(
+                    provider=(cfg.llm.get("provider") or "").strip(),
+                    model=(cfg.llm.get("model") or "deepseek-chat").strip(),
+                )
+            ]
+        except Exception:
+            pass
+        return model
     return DemoAgentModel()
 
 
@@ -506,7 +521,7 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True)
     _default_shell_timeout = int(_running.get("shell_command_timeout", 60))
 
     def _tools_enabled() -> dict[str, bool]:
-        p = Path.home() / ".workbuddy" / "tools_state.json"
+        p = DATA_HOME / "tools_state.json"
         if not p.exists():
             return {}
         try:
@@ -972,16 +987,15 @@ def reset_context_manager() -> None:
 
 
 def _checkpoint_db_path() -> Path:
-    """checkpoint 持久化文件路径（与现有 ~/.workbuddy 数据文件同目录）。"""
-    p = Path.home() / ".workbuddy"
-    p.mkdir(parents=True, exist_ok=True)
-    return p / "checkpoints.sqlite"
+    """checkpoint 持久化文件路径（agent-harness 独立数据目录 DATA_HOME 下）。"""
+    DATA_HOME.mkdir(parents=True, exist_ok=True)
+    return DATA_HOME / "checkpoints.sqlite"
 
 
 def get_shared_checkpointer():
     """所有编译图共享同一个 async SQLite checkpointer。
 
-    状态持久化到 ~/.workbuddy/checkpoints.sqlite，进程重启后可恢复对话/审批/循环
+    状态持久化到 DATA_HOME/checkpoints.sqlite（~/.agent-harness），进程重启后可恢复对话/审批/循环
     状态（对齐 QwenPaw「文件即真相源、重启可恢复」）。
 
     必须由 app lifespan 调用 init_shared_checkpointer() 完成异步初始化后才能使用；

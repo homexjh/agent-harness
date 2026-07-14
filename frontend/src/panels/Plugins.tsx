@@ -841,7 +841,7 @@ export function McpPanel() {
           <button className="newchat small" onClick={() => setModalOpen(true)}>+ Create Client</button>
         </div>
       </div>
-      <p className="panel-hint">Manage Model Context Protocol server configurations in ~/.workbuddy/mcp.json.</p>
+      <p className="panel-hint">Manage Model Context Protocol server configurations in ~/.agent-harness/mcp.json.</p>
 
       {loading ? (
         <div className="muted">Loading…</div>
