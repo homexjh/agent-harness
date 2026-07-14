@@ -60,34 +60,41 @@ _MIGRATE_DIRS = ["workspace", "backups", "sessions"]
 def migrate_from_workbuddy() -> None:
     """首次启动把散落在 ~/.workbuddy 的 agent-harness 数据挪到独立目录 DATA_HOME。
 
+    兼容两种旧布局（按优先级从高到低扫描，命中即迁移，避免重复迁移）：
+    - ~/.workbuddy/state/：后续实际运行使用的布局（cron/sessions/记忆等都在这里）
+    - ~/.workbuddy/：早期版本布局
     仅迁移上面白名单中的 agent-harness 自有文件，绝不触碰 WorkBuddy IDE 的数据
-    （skills/binaries/traces/logs/memory/workbuddy.db 等）。幂等：已存在则跳过。
+    （skills/binaries/traces/logs/memory/workbuddy.db 等）。幂等：目标已存在则跳过。
     """
-    legacy = Path.home() / ".workbuddy"
-    if not legacy.exists():
+    # state/ 是真实活跃布局，优先；早期版本在 ~/.workbuddy/ 直接下级。
+    legacy_dirs = [Path.home() / ".workbuddy" / "state", Path.home() / ".workbuddy"]
+    if not any(d.exists() for d in legacy_dirs):
         return
     DATA_HOME.mkdir(parents=True, exist_ok=True)
-    for name in _MIGRATE_FILES:
-        for suffix in ("", "-wal", "-shm"):
-            src = legacy / f"{name}{suffix}"
-            if src.exists():
-                dst = DATA_HOME / f"{name}{suffix}"
-                if not dst.exists():
-                    shutil.move(str(src), str(dst))
-    for d in _MIGRATE_DIRS:
-        src = legacy / d
-        if src.exists() and src.is_dir():
-            dst = DATA_HOME / d
-            dst.mkdir(parents=True, exist_ok=True)
-            for item in src.iterdir():
-                target = dst / item.name
-                if not target.exists():
-                    shutil.move(str(item), str(target))
-            try:
-                if not any(src.iterdir()):
-                    src.rmdir()
-            except OSError:
-                pass
+    for legacy in legacy_dirs:
+        if not legacy.exists():
+            continue
+        for name in _MIGRATE_FILES:
+            for suffix in ("", "-wal", "-shm"):
+                src = legacy / f"{name}{suffix}"
+                if src.exists():
+                    dst = DATA_HOME / f"{name}{suffix}"
+                    if not dst.exists():
+                        shutil.move(str(src), str(dst))
+        for d in _MIGRATE_DIRS:
+            src = legacy / d
+            if src.exists() and src.is_dir():
+                dst = DATA_HOME / d
+                dst.mkdir(parents=True, exist_ok=True)
+                for item in src.iterdir():
+                    target = dst / item.name
+                    if not target.exists():
+                        shutil.move(str(item), str(target))
+                try:
+                    if not any(src.iterdir()):
+                        src.rmdir()
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
