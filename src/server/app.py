@@ -49,7 +49,7 @@ from .auth import require_auth
 from .ratelimit import rate_limit
 from .model_discovery import discover_models, list_providers
 from .plugins import router as plugins_router, _touch_session
-from .scheduler import start_scheduler, stop_scheduler
+from .scheduler import start_scheduler, stop_scheduler, set_agent_runner
 from .approval_hub import get_hub, set_emitter, clear_emitter
 
 
@@ -89,10 +89,70 @@ async def _pump_graph(graph, input_val, config, out_q: "asyncio.Queue") -> None:
 async def lifespan(app: FastAPI):
     """应用生命周期：启动后台定时任务调度器与审批中枢 poller，退出时关闭。"""
     start_scheduler()
+    _register_scheduler_agent_runner()
     get_hub().start_poller()
     await init_shared_checkpointer()
     yield
     stop_scheduler()
+
+
+# ---------------------------------------------------------------------------
+# 定时任务：agent 类型任务执行器（对齐 QwenPaw cron task_type=agent）
+# 由 scheduler 在后台线程调用；通过主事件循环 run_coroutine_threadsafe 调度 graph.ainvoke。
+# ---------------------------------------------------------------------------
+_scheduler_loop = None
+
+
+def _register_scheduler_agent_runner() -> None:
+    """在 lifespan 启动阶段调用：把当前运行中的主事件循环与 agent runner 注册给 scheduler。"""
+    global _scheduler_loop
+    _scheduler_loop = asyncio.get_running_loop()
+    set_agent_runner(_run_scheduled_agent)
+
+
+async def _agent_invoke(prompt: str, thread_id: str) -> str:
+    """在独立 thread 上重跑 agent（带 web_search 等工具），返回最终文本。"""
+    graph = get_graph()
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 200}
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content=prompt)]}, config
+    )
+    msgs = result.get("messages", []) if isinstance(result, dict) else []
+    for m in reversed(msgs):  # type: ignore[union-attr]
+        if isinstance(m, AIMessage) or getattr(m, "type", None) == "ai":  # type: ignore[union-attr]
+            c = getattr(m, "content", "")
+            if isinstance(c, str) and c.strip():
+                return c
+    return "(无输出)"
+
+
+def _run_scheduled_agent(prompt: str, job: dict) -> str:
+    """scheduler 后台线程入口：把 graph.ainvoke 调度到主事件循环并返回最终文本，再推送通知。"""
+    loop = _scheduler_loop
+    if loop is None:
+        raise RuntimeError("scheduler loop 未初始化")
+    thread_id = f"cron-{job.get('id', 'x')}"
+    fut = asyncio.run_coroutine_threadsafe(_agent_invoke(prompt, thread_id), loop)
+    try:
+        text = fut.result(timeout=300)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"定时 agent 执行失败: {e}") from e
+    _push_notification(job, text)
+    return text
+
+
+def _push_notification(job: dict, text: str) -> None:
+    """把定时 agent 的结果摘要通过桌面通知推送给用户。"""
+    try:
+        from .scheduler import _notification_command
+        import subprocess as _sp
+
+        title = job.get("name", "定时任务") or "定时任务"
+        summary = text[:400] + ("…" if len(text) > 400 else "")
+        cmd = _notification_command(f"{title} 结果：\n{summary}", title=title[:20])
+        _sp.run(cmd, shell=True, timeout=30, capture_output=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 app = FastAPI(title="Agent Harness API", version="0.1.0", lifespan=lifespan)

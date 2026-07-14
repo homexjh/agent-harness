@@ -451,11 +451,47 @@ class ExecArgs(BaseModel):
 
 
 class TimerArgs(BaseModel):
-    """create_timer 工具参数：在指定秒数后触发一次桌面通知提醒。"""
+    """create_timer 工具参数：在指定秒数后触发一次任务。
 
-    seconds: int = Field(..., ge=1, le=3600, description="多少秒后触发提醒（1-3600）")
-    message: str = Field(..., description="提醒内容")
-    title: str = Field(default="喝水提醒", description="提醒标题")
+    - task_type="command"（默认）：到点弹桌面通知提醒（message）。
+    - task_type="agent"：到点**重跑 agent 完成任务并推送结果**（对齐 QwenPaw 的
+      cron create --type agent），用于「一分钟后推送国内3-5条热点新闻」等需求。
+      此时必须提供 prompt（要执行的任务描述）。
+    """
+
+    seconds: int = Field(..., ge=1, le=3600, description="多少秒后触发（1-3600）")
+    message: str = Field(..., description="提醒内容 / 或当 task_type=agent 时本任务的标题")
+    title: str = Field(default="提醒", description="提醒标题")
+    task_type: str = Field(
+        default="command",
+        description="任务类型：command=到点弹桌面通知；agent=到点重跑 agent 完成任务并推送结果（如『一分钟后推送国内3-5条热点新闻』）",
+    )
+    prompt: str = Field(
+        default="",
+        description="当 task_type=agent 时必填：到点要执行的任务描述，例如『获取国内3-5条热点新闻并整理成简报』。",
+    )
+
+
+def _parse_tavily(data: dict) -> str:
+    """把 Tavily 搜索返回的 JSON 解析为纯文本结果（供 web_search 工具复用，便于单测）。
+
+    - 无结果 / 异常结构 → 给出降级提示（建议改用 exec 工具 curl 抓新闻源）。
+    - 正常 → ``[i] 标题\\n    URL: ...\\n    摘要`` 多行文本。
+    """
+    results = data.get("results", []) if isinstance(data, dict) else []
+    if not results:
+        return "未找到相关结果。可改用 exec 工具执行 curl 抓新闻源，或换关键词重试。"
+    lines: list[str] = []
+    for i, r in enumerate(results, 1):
+        if not isinstance(r, dict):
+            continue
+        lines.append(f"[{i}] {r.get('title', '')}")
+        lines.append(f"    URL: {r.get('url', '')}")
+        content = (r.get("content") or "").strip()
+        if content:
+            lines.append(f"    {content}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True):
@@ -681,25 +717,45 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True)
             indent=2,
         )
 
-    def _create_timer(seconds: int, message: str, title: str = "提醒") -> str:
-        """创建一个一次性定时提醒：seconds 秒后通过桌面通知提醒用户。
+    def _create_timer(seconds: int, message: str, title: str = "提醒",
+                      task_type: str = "command", prompt: str = "") -> str:
+        """创建一个一次性定时任务。
 
-        对齐 QwenPaw 的 `cron create`（schedule_type=scheduled, run_at 一次性）：
+        - task_type="command"（默认）：seconds 秒后通过桌面通知提醒用户。
+        - task_type="agent"：seconds 秒后**重跑 agent 完成任务并推送结果**（对齐 QwenPaw
+          的 cron create --type agent）。用于「一分钟后推送国内3-5条热点新闻」这类需求，
+          此时必须提供 prompt（要执行的任务描述）。
+
         任务写入 cron.json 并由后台调度器执行——可见、可删、不阻塞 LLM 主循环。
         """
-        from .scheduler import _notification_command, _cron_db_path
+        from .scheduler import _notification_command, _cron_db_path, sync_jobs
+        import json as _json
 
-        run_at = (datetime.now(timezone.utc()) + timedelta(seconds=seconds)).isoformat()
-        command = _notification_command(message, title)
-        jid = f"timer-{int(datetime.now(timezone.utc()).timestamp())}-{abs(hash(message)) % 10000}"
-        # 直接写入 cron.json（scheduled 一次性），再 sync_jobs 载入调度器
-        try:
-            import json as _json
-            from pathlib import Path as _Path
-            dbp = _cron_db_path()
-            db = _json.loads(dbp.read_text(encoding="utf-8")) if dbp.exists() else {"jobs": []}
-            db["jobs"] = [j for j in db.get("jobs", []) if j.get("id") != jid]
-            db["jobs"].append({
+        run_at = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+        jid = f"timer-{int(datetime.now(timezone.utc).timestamp())}-{abs(hash(message)) % 10000}"
+
+        if task_type == "agent":
+            if not (prompt or "").strip():
+                return _json.dumps(
+                    {"ok": False, "error": "task_type=agent 时必须提供 prompt（要执行的任务描述）"},
+                    ensure_ascii=False,
+                )
+            job = {
+                "id": jid,
+                "name": f"{title}：{message}",
+                "schedule": "",
+                "command": "",
+                "enabled": True,
+                "task_type": "agent",
+                "prompt": prompt,
+                "timezone": "Asia/Shanghai",
+                "schedule_type": "scheduled",
+                "run_at": run_at,
+                "created": int(datetime.now(timezone.utc).timestamp()),
+            }
+        else:
+            command = _notification_command(message, title)
+            job = {
                 "id": jid,
                 "name": f"{title}：{message}",
                 "schedule": "",
@@ -709,21 +765,35 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True)
                 "timezone": "Asia/Shanghai",
                 "schedule_type": "scheduled",
                 "run_at": run_at,
-                "created": int(datetime.now(timezone.utc()).timestamp()),
-            })
+                "created": int(datetime.now(timezone.utc).timestamp()),
+            }
+
+        # 直接写入 cron.json（scheduled 一次性），再 sync_jobs 载入调度器
+        try:
+            dbp = _cron_db_path()
+            db = _json.loads(dbp.read_text(encoding="utf-8")) if dbp.exists() else {"jobs": []}
+            db["jobs"] = [j for j in db.get("jobs", []) if j.get("id") != jid]
+            db["jobs"].append(job)
             dbp.parent.mkdir(parents=True, exist_ok=True)
             dbp.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
             sync_jobs()
         except Exception as e:  # noqa: BLE001
             return _json.dumps({"ok": False, "error": f"无法写入定时任务: {e}"}, ensure_ascii=False)
+
+        note = (
+            "已加入 Cron 列表（agent 任务），到点将自动重跑 agent 完成任务并推送结果；可在 Cron 面板查看/删除。"
+            if task_type == "agent"
+            else "已加入 Cron 列表，可在 Cron 面板查看/删除。"
+        )
         return _json.dumps(
             {
                 "ok": True,
                 "job_id": jid,
+                "task_type": task_type,
                 "run_at": run_at,
                 "message": message,
                 "seconds": seconds,
-                "note": "已加入 Cron 列表，可在 Cron 面板查看/删除。",
+                "note": note,
             },
             ensure_ascii=False,
             indent=2,
@@ -773,8 +843,49 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True)
     create_timer = StructuredTool.from_function(
         func=_create_timer,
         name="create_timer",
-        description="创建一个一次性定时提醒：在 seconds 秒后通过桌面通知提醒用户。用于‘10秒后提醒我喝水’这类需求，优先使用本工具而不是 exec。",
+        description=(
+            "创建一个一次性定时任务，在 seconds 秒后触发。\n"
+            "- task_type='command'（默认）：到点弹桌面通知提醒（用于『10秒后提醒我喝水』）。\n"
+            "- task_type='agent'：到点**重跑 agent 完成任务并推送结果**（用于『一分钟后推送国内3-5条热点新闻』"
+            "『每天早8点汇报天气』等）。此时必须提供 prompt=要执行的任务描述。\n"
+            "用于『X 秒/分钟后帮我做某事/推送某事』这类需求，优先用本工具而不是 exec。"
+        ),
         args_schema=TimerArgs,
+    )
+
+    def _web_search(search_term: str, max_results: int = 5) -> str:
+        """搜索实时网络信息（新闻 / 当前事件 / 最新资料），返回标题、URL 与内容摘要文本。
+
+        对齐 QwenPaw 的 web_search（Tavily keyless API）。用于获取训练数据之外的实时信息，
+        例如「今日国内热点新闻」「某事件最新进展」。失败时给出降级提示（可用 exec 工具 curl 抓新闻源）。
+        """
+        import httpx as _httpx
+
+        query = (search_term or "").strip()
+        if not query:
+            return "Error: search_term is empty."
+        url = "https://api.tavily.com/search"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Tavily-Access-Mode": "keyless",
+        }
+        payload = {
+            "query": query,
+            "max_results": int(max_results),
+            "search_depth": "basic",
+        }
+        try:
+            with _httpx.Client(timeout=30, verify=False) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+            return _parse_tavily(data)
+        except Exception as e:  # noqa: BLE001
+            return f"web_search 失败：{e}\n\n可改用 exec 工具执行 curl 抓新闻源，或换关键词重试。"
+
+    web_search = StructuredTool.from_function(
+        func=_web_search, name="web_search",
+        description="搜索实时网络信息（新闻、当前事件、最新资料）。返回若干条结果的标题、URL 与内容摘要文本。用于获取『最新热点新闻』『当前事件进展』等训练数据之外的实时信息。当需要国内热点新闻时，搜索词用中文（如『今日国内热点新闻 TOP5』）。",
     )
 
     # 常规工具：标准三守卫（含 FilePath 沙箱、ShellEvasion）
@@ -795,6 +906,7 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True)
             view_video,
             get_current_time,
             create_timer,
+            web_search,
         ],
         std_engine,
     )

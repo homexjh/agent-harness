@@ -84,8 +84,30 @@ def _record_run(job: dict, status: str, output: str = "", error: str = "") -> di
     return record
 
 
+# ---------------------------------------------------------------------------
+# Agent 任务执行器钩子（由 app.py 在启动时注册）
+# ---------------------------------------------------------------------------
+_agent_runner = None  # type: ignore[var-annotated]
+
+
+def set_agent_runner(fn) -> None:
+    """注册 agent 任务执行器：fn(prompt: str, job: dict) -> str（同步返回结果文本）。
+
+    由 app.py 在 lifespan 中注册，内部通过主事件循环 run_coroutine_threadsafe 调度
+    graph.ainvoke，对齐 QwenPaw 的 cron task_type=agent（到点重跑整个 agent）。
+    """
+    global _agent_runner
+    _agent_runner = fn
+
+
 def _run_job(job: dict) -> dict:
-    """执行单个 cron 任务。注意：APScheduler 会在后台线程中调用此函数。"""
+    """执行单个 cron 任务。注意：APScheduler 会在后台线程中调用此函数。
+
+    - task_type="agent"：重跑 agent 完成任务并推送结果（对齐 QwenPaw cron create --type agent）。
+    - 其它（默认 command）：执行 shell 命令。
+    """
+    if (job.get("task_type") or "command") == "agent":
+        return _run_agent_job(job)
     command = (job.get("command") or "").strip()
     if not command:
         return _record_run(job, "error", error="命令为空")
@@ -114,6 +136,40 @@ def _run_job(job: dict) -> dict:
                 _remove_job_from_db(job.get("id"))
             except Exception:
                 pass
+    return rec
+
+
+def _run_agent_job(job: dict) -> dict:
+    """执行 agent 类型定时任务：调用注册的 runner 重跑 agent 完成任务。
+
+    APScheduler 在后台线程调用此函数；runner 内部负责把 async 调度到主事件循环执行
+    graph.ainvoke。结果写入 cron_history；一次性任务触发后从 cron.json 清理。
+    """
+    prompt = (job.get("prompt") or "").strip()
+    if not prompt:
+        rec = _record_run(job, "error", error="agent 任务缺少 prompt")
+    elif _agent_runner is None:
+        rec = _record_run(job, "error", error="agent runner 未注册，无法执行 agent 任务")
+    else:
+        try:
+            output = _agent_runner(prompt, job)
+            rec = _record_run(job, "success", output=output)
+            # 推送结果到桌面通知（对齐 QwenPaw 的 channel 推送：到点把结果推给用户）
+            try:
+                _push_notification(
+                    (output or "").replace("\n", " ")[:280],
+                    title=(job.get("name") or "定时任务")[:40],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as e:  # noqa: BLE001
+            rec = _record_run(job, "error", error=f"{type(e).__name__}: {e}")
+    # 一次性任务（有 run_at）触发后从列表移除，保持列表干净（对齐 qwenpaw once）
+    if job.get("run_at") and rec.get("status") in ("success", "failed"):
+        try:
+            _remove_job_from_db(job.get("id"))
+        except Exception:
+            pass
     return rec
 
 
@@ -290,16 +346,28 @@ def get_scheduler() -> Optional[BackgroundScheduler]:
 
 
 def _notification_command(message: str, title: str = "提醒") -> str:
-    """生成跨平台桌面通知命令（macOS osascript / Linux notify-send）。"""
-    import shlex
+    """生成跨平台桌面通知命令（macOS osascript / Linux notify-send）。
 
-    safe_msg = shlex.quote(message)
-    safe_title = shlex.quote(title)
+    消息与标题中的双引号/反斜杠已转义，可安全嵌入 osascript 的双引号字符串，
+    避免中文/特殊字符导致 osascript 语法错误（原实现用 shlex.quote 产生单引号嵌套）。
+    """
+    # 转义：反斜杠先转，再转义双引号，使其能嵌入 osascript 的双引号字符串
+    safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
+    safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
     return (
-        f"(command -v osascript >/dev/null 2>&1 && osascript -e 'display notification {safe_msg} with title {safe_title}') || "
-        f"(command -v notify-send >/dev/null 2>&1 && notify-send {safe_title} {safe_msg}) || "
-        f"echo 'no notification provider'"
+        f'(command -v osascript >/dev/null 2>&1 && osascript -e \'display notification "{safe_msg}" with title "{safe_title}"\') || '
+        f'(command -v notify-send >/dev/null 2>&1 && notify-send "{safe_title}" "{safe_msg}") || '
+        f'echo "no notification provider"'
     )
+
+
+def _push_notification(message: str, title: str = "定时任务") -> None:
+    """在后台线程中执行桌面通知（用于 agent 任务结果推送）。失败静默忽略。"""
+    try:
+        cmd = _notification_command(message, title)
+        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def schedule_one_time(
