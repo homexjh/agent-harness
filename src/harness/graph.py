@@ -65,8 +65,17 @@ def _last_human_text(messages: list) -> str:
 def make_context_node(context_manager: ContextManager, system_hint: str = None, memory_manager=None, core_files_manager=None):
     def context_node(state: dict, config: RunnableConfig) -> dict:
         _t = time.perf_counter()
-        thread_id = (config or {}).get("configurable", {}).get("thread_id", "default")
+        conf = (config or {}).get("configurable", {})
+        thread_id = conf.get("thread_id", "default")
+        user_id = conf.get("user_id", "default")
         raw = state.get("messages", [])
+        # 多用户隔离：运行时按当前 user 解析管理器。图在编译期按 (model,mode) 缓存，
+        # 锁定的全局单例不能跨用户共享记忆/上下文，故此处按 config 里的 user_id 现取。
+        # user_id 由 app 层在请求入口注入到 config["configurable"]。
+        from server.graph_provider import get_context_manager, get_memory_manager
+
+        cm = get_context_manager(user_id)
+        mm = get_memory_manager(user_id)
 
         # Build final system hint: core files (layer-1) first, then mode-specific hint.
         final_hint_parts = []
@@ -84,24 +93,24 @@ def make_context_node(context_manager: ContextManager, system_hint: str = None, 
         logger.info("CTX_CORE thread=%s dt=%.3fs", thread_id, time.perf_counter() - _t0)
 
         _t1 = time.perf_counter()
-        window, cstate = context_manager.prepare(raw, thread_id, system_hint=final_hint)
+        window, cstate = cm.prepare(raw, thread_id, system_hint=final_hint)
         logger.info("CTX_PREPARE thread=%s dt=%.3fs msgs=%d", thread_id, time.perf_counter() - _t1, len(raw))
 
         # 长期记忆（对齐 QwenPaw 的 ReMeLight）：
         # - auto_memory：按 auto_memory_interval 把对话事实写入 vault；
         # - auto_memory_search：回复前用最新用户消息做混合检索，命中则注入系统提示。
-        if memory_manager is not None:
+        if mm is not None:
             try:
                 _t2 = time.perf_counter()
-                fut = _MEMORY_EXECUTOR.submit(memory_manager.auto_memory, raw, thread_id=thread_id)
+                fut = _MEMORY_EXECUTOR.submit(mm.auto_memory, raw, thread_id=thread_id)
                 fut.add_done_callback(_log_memory_exception)
                 logger.info("CTX_AUTOMEM thread=%s dt=%.3fs", thread_id, time.perf_counter() - _t2)
-                ams = memory_manager.cfg.reme_light_memory_config.auto_memory_search_config
+                ams = mm.cfg.reme_light_memory_config.auto_memory_search_config
                 if ams.enabled:
                     _t3 = time.perf_counter()
                     last_user = _last_human_text(raw)
                     if last_user:
-                        hit = memory_manager.memory_search(last_user, ams.max_results)
+                        hit = mm.memory_search(last_user, ams.max_results)
                         if not hit.startswith(f"memory_search('{last_user}'): no"):
                             window = [
                                 SystemMessage(

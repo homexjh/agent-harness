@@ -21,6 +21,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from .config import DATA_HOME
+from .user_ctx import get_user
 
 
 def _workbuddy_dir() -> Path:
@@ -29,7 +30,15 @@ def _workbuddy_dir() -> Path:
     return DATA_HOME
 
 
-CONFIG_PATH = _workbuddy_dir() / "context_config.json"
+def _config_path(user_id: str | None = None) -> Path:
+    """按用户隔离的 context 配置路径：DATA_HOME/{user_id}/context_config.json。"""
+    uid = user_id or get_user()
+    d = _workbuddy_dir() / uid
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "context_config.json"
+
+
+CONFIG_PATH = _config_path()  # 兼容引用（默认用户）；实际读写走 _config_path()
 
 
 # ---------------------------------------------------------------------------
@@ -50,19 +59,21 @@ def default_config() -> ContextManagerConfig:
     return ContextManagerConfig()
 
 
-def load_config() -> ContextManagerConfig:
-    if CONFIG_PATH.exists():
+def load_config(user_id: str | None = None) -> ContextManagerConfig:
+    p = _config_path(user_id)
+    if p.exists():
         try:
             return ContextManagerConfig(
-                **json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                **json.loads(p.read_text(encoding="utf-8"))
             )
         except Exception:
             return ContextManagerConfig()
     return ContextManagerConfig()
 
 
-def save_config(cfg: ContextManagerConfig) -> None:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(
+def save_config(cfg: ContextManagerConfig, user_id: str | None = None) -> None:
+    p = _config_path(user_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
         json.dumps(cfg.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8"
     )

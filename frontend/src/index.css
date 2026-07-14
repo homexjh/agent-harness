@@ -930,6 +930,84 @@ body {
   color: rgba(26, 23, 22, 0.35);
 }
 
+/* 当前登录用户标识 + 退出 */
+.user-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  margin: 0 2px;
+  background: rgba(47, 107, 255, 0.08);
+  border: 1px solid rgba(47, 107, 255, 0.18);
+  border-radius: 10px;
+  font-size: 13px;
+  color: #1a1716;
+}
+.user-chip .user-avatar { font-size: 14px; }
+.user-chip .user-name { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-chip .user-logout {
+  border: none;
+  background: transparent;
+  color: #2f6bff;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+}
+.user-chip .user-logout:hover { text-decoration: underline; }
+
+/* 登录页（服务级鉴权开启时） */
+.login-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, #0f1226, #1b1f3a 60%, #2a1f4a);
+}
+.login-card {
+  width: 340px;
+  background: #fff;
+  border-radius: 16px;
+  padding: 28px 26px 24px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  text-align: center;
+}
+.login-logo { font-size: 40px; }
+.login-title { font-weight: 800; font-size: 20px; color: #1a1716; }
+.login-sub { font-size: 13px; color: rgba(26, 23, 22, 0.5); margin-bottom: 4px; }
+.login-msg {
+  font-size: 13px;
+  color: #c0392b;
+  background: rgba(192, 57, 43, 0.08);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.login-field { display: flex; flex-direction: column; gap: 4px; text-align: left; }
+.login-field span { font-size: 12px; color: rgba(26, 23, 22, 0.5); }
+.login-field input {
+  padding: 9px 11px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 9px;
+  font-size: 14px;
+  outline: none;
+}
+.login-field input:focus { border-color: #2f6bff; }
+.login-submit {
+  margin-top: 6px;
+  padding: 10px;
+  border: none;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #2f6bff, #7b5bff);
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+  cursor: pointer;
+}
+.login-submit:disabled { opacity: 0.55; cursor: not-allowed; }
+
 .sidebar-top-sticky {
   flex-shrink: 0;
   display: flex;

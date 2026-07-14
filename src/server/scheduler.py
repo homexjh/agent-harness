@@ -552,13 +552,31 @@ def get_job_state(jid: str) -> dict:
 # Memory Manager 调度（dream cron）
 # ---------------------------------------------------------------------------
 def _memory_dream_job() -> None:
-    """后台线程中触发一次记忆 dream（整合/去重）。"""
-    try:
-        from .memory import get_memory_manager
+    """后台线程中触发一次记忆 dream（整合/去重）。
 
-        mm = get_memory_manager()
-        if mm is not None:
-            mm.dream()
+    按用户隔离：遍历 DATA_HOME 下所有含 memory_vault 的用户目录，逐个做 dream；
+    auth 关闭时只有 default 用户，行为与原全局单例一致。
+    """
+    try:
+        from pathlib import Path
+
+        from . import memory as memory_mod
+        from .config import DATA_HOME
+
+        # 收集所有需要 dream 的用户（auth 关闭时仅 default）
+        uids: set[str] = {"default"}
+        base = Path(DATA_HOME)
+        if base.is_dir():
+            for udir in base.glob("*"):
+                if udir.is_dir() and (udir / "memory_vault").exists():
+                    uids.add(udir.name)
+        for uid in sorted(uids):
+            try:
+                mm = memory_mod.get_memory_manager(uid)
+                if mm is not None:
+                    mm.dream()
+            except Exception as e:  # noqa: BLE001
+                print(f"[memory] dream job failed for {uid}: {e}")
     except Exception as e:  # noqa: BLE001
         print(f"[memory] dream job failed: {e}")
 

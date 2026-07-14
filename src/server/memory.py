@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from langchain_core.tools import StructuredTool
 
 from .config import DATA_HOME
+from .user_ctx import get_user
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +50,24 @@ def _workspace_dir() -> Path:
     return p
 
 
-VAULT_DIR = _workbuddy_dir() / "memory_vault"
-CONFIG_PATH = _workbuddy_dir() / "memory_config.json"
+def _vault_dir(user_id: str | None = None) -> Path:
+    """按用户隔离的记忆保险库路径：DATA_HOME/{user_id}/memory_vault。"""
+    uid = user_id or get_user()
+    d = _workbuddy_dir() / uid / "memory_vault"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _config_path(user_id: str | None = None) -> Path:
+    """按用户隔离的记忆配置路径：DATA_HOME/{user_id}/memory_config.json。"""
+    uid = user_id or get_user()
+    d = _workbuddy_dir() / uid
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "memory_config.json"
+
+
+VAULT_DIR = _vault_dir()  # 兼容引用（默认用户）；实际读写走 _vault_dir()
+CONFIG_PATH = _config_path()
 
 
 # ---------------------------------------------------------------------------
@@ -110,18 +127,20 @@ def default_config() -> MemoryManagerConfig:
     return MemoryManagerConfig()
 
 
-def load_config() -> MemoryManagerConfig:
-    if CONFIG_PATH.exists():
+def load_config(user_id: str | None = None) -> MemoryManagerConfig:
+    p = _config_path(user_id)
+    if p.exists():
         try:
-            return MemoryManagerConfig(**json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+            return MemoryManagerConfig(**json.loads(p.read_text(encoding="utf-8")))
         except Exception:
             return MemoryManagerConfig()
     return MemoryManagerConfig()
 
 
-def save_config(cfg: MemoryManagerConfig) -> None:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(
+def save_config(cfg: MemoryManagerConfig, user_id: str | None = None) -> None:
+    p = _config_path(user_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
         json.dumps(cfg.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
@@ -433,10 +452,11 @@ class MemoryVault:
 # Memory Manager
 # ---------------------------------------------------------------------------
 class MemoryManager:
-    def __init__(self, cfg: MemoryManagerConfig, working_dir: Optional[str] = None):
+    def __init__(self, cfg: MemoryManagerConfig, working_dir: Optional[str] = None, user_id: str | None = None):
         self.cfg = cfg
+        self.user_id = user_id or get_user()
         self.working_dir = working_dir or str(_workspace_dir())
-        self.vault = MemoryVault(VAULT_DIR, EmbeddingClient(cfg.reme_light_memory_config.embedding_model_config))
+        self.vault = MemoryVault(_vault_dir(self.user_id), EmbeddingClient(cfg.reme_light_memory_config.embedding_model_config))
         self._started = False
         self._turn_count: dict[str, int] = {}
         self._last_dream: Optional[str] = None
@@ -608,8 +628,13 @@ class MemoryManager:
         )
 
     def list_memory_tools(self) -> list:
+        # 工具在 graph 运行时被调用，处于当前请求的 user 上下文内，
+        # 因此运行时按当前 user 解析 manager，保证检索命中该用户自己的记忆保险库。
         def _search(query: str, max_results: int = 5) -> str:
-            return self.memory_search(query, max_results)
+            mm = get_memory_manager()
+            if mm is None:
+                return "memory_search: long-term memory is disabled."
+            return mm.memory_search(query, max_results)
 
         return [
             StructuredTool.from_function(
@@ -639,27 +664,28 @@ class MemoryManager:
 
 
 # ---------------------------------------------------------------------------
-# 单例
+# 按用户隔离的管理器工厂（缓存 {user_id: MemoryManager}）
 # ---------------------------------------------------------------------------
-_mm: Optional[MemoryManager] = None
+_managers: dict[str, "MemoryManager"] = {}
 _mm_lock = threading.Lock()
 
 
-def get_memory_manager() -> Optional[MemoryManager]:
-    global _mm
+def get_memory_manager(user_id: str | None = None) -> Optional[MemoryManager]:
+    uid = user_id or get_user()
     with _mm_lock:
-        if _mm is not None:
-            return _mm
+        if uid in _managers:
+            return _managers[uid]
         # 单一事实源：runtime.json 的 running 段（与 QwenPaw 对齐）
         cfg = runtime_memory_config()
         if cfg.backend == "none":
             return None
-        _mm = MemoryManager(cfg)
-        _mm.start()
-        return _mm
+        mm = MemoryManager(cfg, user_id=uid)
+        mm.start()
+        _managers[uid] = mm
+        return mm
 
 
 def reset_memory_manager() -> None:
-    global _mm
+    global _managers
     with _mm_lock:
-        _mm = None
+        _managers = {}

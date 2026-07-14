@@ -46,7 +46,8 @@ from .graph_provider import (
 )
 from .sse_utils import interrupt_to_dict, jsonable, jsonable_state, sse, sse_comment
 from .config import get_config, save_config, _repo_root, migrate_from_workbuddy
-from .auth import require_auth
+from .auth import require_auth, encode_token, verify_login
+from .user_ctx import set_user, reset_user, SYSTEM_USER
 from .ratelimit import rate_limit
 from .model_discovery import discover_models, list_providers
 from .plugins import router as plugins_router, _touch_session
@@ -122,13 +123,17 @@ def _register_scheduler_agent_runner() -> None:
     set_agent_runner(_run_scheduled_agent)
 
 
-async def _agent_invoke(prompt: str, thread_id: str) -> str:
+async def _agent_invoke(prompt: str, thread_id: str, user_id: str = "default") -> str:
     """在独立 thread 上重跑 agent（带 web_search 等工具），返回最终文本。"""
     graph = get_graph()
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 200}
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content=prompt)]}, config
-    )
+    token = set_user(user_id)
+    try:
+        config = {"configurable": {"thread_id": _ckpt_thread(user_id, thread_id), "user_id": user_id}, "recursion_limit": 200}
+        result = await graph.ainvoke(
+            {"messages": [HumanMessage(content=prompt)]}, config
+        )
+    finally:
+        reset_user(token)
     msgs = result.get("messages", []) if isinstance(result, dict) else []
     for m in reversed(msgs):  # type: ignore[union-attr]
         if isinstance(m, AIMessage) or getattr(m, "type", None) == "ai":  # type: ignore[union-attr]
@@ -144,7 +149,7 @@ def _run_scheduled_agent(prompt: str, job: dict) -> str:
     if loop is None:
         raise RuntimeError("scheduler loop 未初始化")
     thread_id = f"cron-{job.get('id', 'x')}"
-    fut = asyncio.run_coroutine_threadsafe(_agent_invoke(prompt, thread_id), loop)
+    fut = asyncio.run_coroutine_threadsafe(_agent_invoke(prompt, thread_id, SYSTEM_USER), loop)
     try:
         text = fut.result(timeout=300)
     except Exception as e:  # noqa: BLE001
@@ -274,9 +279,62 @@ async def get_assistant(assistant_id: str):
     }
 
 
+def _ckpt_thread(user_id: str, thread_id: str) -> str:
+    """会话在 checkpointer / context store 中的复合键，天然按用户隔离。"""
+    return f"{user_id}:{thread_id}"
+
+
+async def _with_user(user_id: str, gen):
+    """在生成器执行期间把 user_id 注入请求上下文（多用户隔离）。"""
+    token = set_user(user_id)
+    try:
+        async for chunk in gen:
+            yield chunk
+    finally:
+        reset_user(token)
+
+
 @app.post("/threads")
-async def create_thread(payload: dict = {}):
+async def create_thread(payload: dict = {}, _auth: str = Depends(require_auth)):
     tid = payload.get("thread_id") or uuid.uuid4().hex
+    _touch_session(tid, user_id=_auth)
+    return _thread_obj(tid)
+
+
+# ---------------------------------------------------------------------------
+# 鉴权：登录签发令牌 + 前端探测开关
+# ---------------------------------------------------------------------------
+@app.post("/auth/login")
+async def auth_login(request: Request):
+    """服务级登录：校验 security.users，成功返回签名令牌（Bearer）。
+
+    仅当 security.enable_auth=True 时有效；关闭鉴权时返回 400（前端不应调用）。
+    """
+    cfg = get_config()
+    if not cfg.security.get("enable_auth"):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "auth disabled"})
+    body = await request.json()
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
+    role = verify_login(username, password)
+    if not role:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "invalid credentials"})
+    token = encode_token(username)
+    return {"ok": True, "token": token, "user_id": username, "role": role}
+
+
+@app.get("/auth/status")
+async def auth_status():
+    """前端据此决定是否展示登录页（不泄露用户列表等敏感信息）。"""
+    cfg = get_config()
+    return {"enable_auth": bool(cfg.security.get("enable_auth"))}
+
+
+@app.post("/sessions")
+async def create_session(payload: dict = {}, _auth: str = Depends(require_auth)):
+    """显式创建会话（与 POST /threads 等价，归属当前用户）。"""
+    tid = payload.get("thread_id") or uuid.uuid4().hex
+    _touch_session(tid, user_id=_auth)
     return _thread_obj(tid)
 
 
@@ -291,7 +349,7 @@ async def search_threads(payload: dict = {}):
 
 
 @app.post("/threads/{thread_id}/reset")
-async def reset_thread(thread_id: str):
+async def reset_thread(thread_id: str, _auth: str = Depends(require_auth)):
     """重置一个卡死的会话线程（对齐 QwenPaw 的文件态可恢复）。
 
     彻底清除该 thread 的：
@@ -300,32 +358,33 @@ async def reset_thread(thread_id: str):
     - 上下文 store 中的历史 turn。
     让卡住的 thread 能原地救活，无需开新对话。
     """
+    ck = _ckpt_thread(_auth, thread_id)
     # 1) 清未决审批登记（解除可能挂起的 await future，并清共享表）
     try:
-        get_hub().clear_thread(thread_id)
+        get_hub().clear_thread(ck)
     except Exception:  # noqa: BLE001
-        logger.warning("reset_thread clear_approval failed thread=%s", thread_id)
+        logger.warning("reset_thread clear_approval failed thread=%s", ck)
     # 2) 删 checkpoint（含挂起 interrupt）—— MemorySaver.delete_thread 等价“丢弃该线程状态”
     cp = get_shared_checkpointer()
     try:
-        await cp.adelete_thread(thread_id)
+        await cp.adelete_thread(ck)
     except Exception:  # noqa: BLE001
-        logger.warning("reset_thread delete_checkpoint failed thread=%s", thread_id)
+        logger.warning("reset_thread delete_checkpoint failed thread=%s", ck)
     # 3) 清上下文 store 历史
     try:
-        cm = get_context_manager()
-        cm.clear(thread_id)
+        cm = get_context_manager(_auth)
+        cm.clear(ck)
     except Exception:  # noqa: BLE001
-        logger.warning("reset_thread clear_context failed thread=%s", thread_id)
-    logger.info("thread reset thread=%s", thread_id)
+        logger.warning("reset_thread clear_context failed thread=%s", ck)
+    logger.info("thread reset thread=%s", ck)
     return {"ok": True, "thread_id": thread_id}
 
 
 @app.get("/threads/{thread_id}/state")
 @app.post("/threads/{thread_id}/state")
-async def get_state(thread_id: str):
+async def get_state(thread_id: str, _auth: str = Depends(require_auth)):
     graph = get_graph()
-    cfg = {"configurable": {"thread_id": thread_id}}
+    cfg = {"configurable": {"thread_id": _ckpt_thread(_auth, thread_id)}}
     try:
         snap = await graph.aget_state(cfg)
     except Exception:
@@ -389,7 +448,7 @@ def _extract_stream_bits(msg_chunk: Any):
     return {"answer": "".join(answer_parts), "reasoning": reasoning}
 
 
-async def _run_stream(thread_id: str, body: dict):
+async def _run_stream_impl(thread_id: str, body: dict, user_id: str = "default"):
     """SSE 生成器：把图运行过程以 Platform 兼容事件流吐出。"""
     graph = get_graph()
     run_id = uuid.uuid4().hex
@@ -418,7 +477,7 @@ async def _run_stream(thread_id: str, body: dict):
     if "values" not in modes:
         modes = list(modes) + ["values"]
 
-    config: dict = {"configurable": {"thread_id": thread_id}, "recursion_limit": 200}
+    config: dict = {"configurable": {"thread_id": _ckpt_thread(user_id, thread_id), "user_id": user_id}, "recursion_limit": 200}
     bcfg = body.get("config") or {}
     if isinstance(bcfg, dict):
         config["configurable"].update(bcfg.get("configurable", {}))
@@ -507,6 +566,12 @@ async def _run_stream(thread_id: str, body: dict):
         # 客户端断开时状态不丢，恢复后可继续（即“取消时保存”的保证）。
 
 
+async def _run_stream(thread_id: str, body: dict, user_id: str = "default"):
+    """SSE 流式端点包装：注入当前用户上下文，实现多用户隔离。"""
+    async for chunk in _with_user(user_id, _run_stream_impl(thread_id, body, user_id)):
+        yield chunk
+
+
 def _delta(prev: str, cur: str) -> str:
     """计算 cur 相对 prev 的新增后缀，兼容“增量”与“累积”两种上游载荷，避免前端重复拼接。"""
     if not cur:
@@ -516,7 +581,13 @@ def _delta(prev: str, cur: str) -> str:
     return cur
 
 
-async def _run_envelope(thread_id: str, body: dict):
+async def _run_envelope(thread_id: str, body: dict, user_id: str = "default"):
+    """QwenPaw 式自研 SSE 信封（包装 _run_envelope_impl，注入当前用户上下文实现多用户隔离）。"""
+    async for chunk in _with_user(user_id, _run_envelope_impl(thread_id, body)):
+        yield chunk
+
+
+async def _run_envelope_impl(thread_id: str, body: dict, user_id: str = "default"):
     """QwenPaw 式自研 SSE 信封：后端自己解析每个 chunk，增量吐事件，前端只管 append。
 
     事件：
@@ -573,16 +644,17 @@ async def _run_envelope(thread_id: str, body: dict):
     # 审批走 hub（原地 Future）：前端通过 /api/approval/{thread_id} 决议，不再用 command.resume。
     input_val = {"messages": [HumanMessage(content=body.get("message", ""))]}
 
-    # 会话索引：用于侧边栏 Sessions 面板
-    _touch_session(thread_id, title=body.get("message", "")[:30])
+    # 会话索引：用于侧边栏 Sessions 面板（按用户隔离）
+    _touch_session(thread_id, title=body.get("message", "")[:30], user_id=user_id)
 
-    config: dict = {"configurable": {"thread_id": thread_id}, "recursion_limit": 200}
+    ck = _ckpt_thread(user_id, thread_id)
+    config: dict = {"configurable": {"thread_id": ck, "user_id": user_id}, "recursion_limit": 200}
 
     # 若上一轮审批仍挂起（用户没裁决就发了新消息）：先以「拒绝」解除旧 graph 任务的挂起，
     # 再开始新消息；否则旧任务会一直停在 await future 上。
     try:
         _hub = get_hub()
-        _rid = _hub.pending_for_thread(thread_id)
+        _rid = _hub.pending_for_thread(ck)
         if _rid:
             _hub.resolve(_rid, "rejected")
     except Exception:  # noqa: BLE001
@@ -609,7 +681,7 @@ async def _run_envelope(thread_id: str, body: dict):
     async def _emit(request_id: str, question: Any) -> None:
         await out_q.put(("__approval__", request_id, question))
 
-    set_emitter(thread_id, _emit)
+    set_emitter(ck, _emit)
 
     graph_task = None
     try:
@@ -757,7 +829,7 @@ async def _run_envelope(thread_id: str, body: dict):
                     yield sse("reasoning", {"delta": d, "phase": reasoning_phase})
 
         # 图结束后收尾：审批事件已在流式过程中内联推给前端，此处无需再检查 interrupt。
-        clear_emitter(thread_id)
+        clear_emitter(ck)
         try:
             await graph_task
         except Exception:  # noqa: BLE001
@@ -779,7 +851,7 @@ async def _run_envelope(thread_id: str, body: dict):
         yield sse("error", {"message": err_msg})
     finally:
         # 无论正常/异常，都要清理 emitter 并取消可能仍在 await future 的后台图任务
-        clear_emitter(thread_id)
+        clear_emitter(ck)
         if graph_task is not None and not graph_task.done():
             graph_task.cancel()
 
@@ -794,7 +866,7 @@ async def api_chat(
     """QwenPaw 式流式聊天端点。body 可携带 model/reasoning/api_key/base_url/provider 即时切换模型。"""
     body = await request.json()
     return StreamingResponse(
-        _run_envelope(thread_id, body),
+        _run_envelope(thread_id, body, _auth or "default"),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -831,10 +903,12 @@ async def api_approval(
     hub = get_hub()
     if not request_id:
         return JSONResponse({"ok": False, "error": "missing request_id"}, status_code=400)
-    # 校验该 request_id 确实属于本 thread 的未决审批（防止越权决议）
-    if hub.pending_for_thread(thread_id) != request_id:
+    # 校验该 request_id 确实属于本 thread 的未决审批（防止越权决议）。
+    # 用复合键 user:thread 隔离：不同用户的同名 thread 不会串审批。
+    ck = _ckpt_thread(_auth or "default", thread_id)
+    if hub.pending_for_thread(ck) != request_id:
         # 跨 worker 场景：本 worker 不持有该 future，但共享表里有，resolve 仍生效
-        rows = [r for r in hub._store_fetch(thread_id) if r["request_id"] == request_id and r["status"] == "pending"]
+        rows = [r for r in hub._store_fetch(ck) if r["request_id"] == request_id and r["status"] == "pending"]
         if not rows:
             return JSONResponse({"ok": False, "error": "unknown or expired request_id"}, status_code=404)
     hub.resolve(request_id, decision)
@@ -850,7 +924,7 @@ async def run_stream(
 ):
     body = await request.json()
     return StreamingResponse(
-        _run_stream(thread_id, body),
+        _run_stream(thread_id, body, _auth or "default"),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -875,8 +949,13 @@ async def create_run(
         input_val = Command(resume=command.get("resume"), goto=command.get("goto"), update=command.get("update"))
     else:
         input_val = body.get("input") or {}
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 200}
-    result = await graph.ainvoke(input_val, config)
+    uid = _auth or "default"
+    token = set_user(uid)
+    try:
+        config = {"configurable": {"thread_id": _ckpt_thread(uid, thread_id), "user_id": uid}, "recursion_limit": 200}
+        result = await graph.ainvoke(input_val, config)
+    finally:
+        reset_user(token)
     get_metrics().turn()
     return {
         "run_id": uuid.uuid4().hex,
@@ -907,14 +986,17 @@ async def modes():
 
 
 @app.get("/context/{thread_id}")
-async def context_inspect(thread_id: str, preview: int = 200):
+async def context_inspect(thread_id: str, preview: int = 200, _auth: str | None = Depends(require_auth)):
     """上下文检视：返回某会话已写穿的全部轮次、折叠情况、预算与召回开关。
 
     供前端「上下文面板」渲染 fold-not-summarize 的真实状态（哪些 seq 被折叠、
     窗口大小、总轮次、是否启用召回），让工业级上下文管理可观测、可解释。
+
+    存储键为复合键 user:thread，故按当前用户拼出复合键再检视。
     """
-    cm = get_context_manager()
-    return cm.inspect(thread_id, preview_chars=preview)
+    uid = _auth or "default"
+    cm = get_context_manager(uid)
+    return cm.inspect(f"{uid}:{thread_id}", preview_chars=preview)
 
 
 # ---------------------------------------------------------------------------

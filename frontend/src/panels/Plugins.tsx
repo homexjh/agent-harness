@@ -1184,7 +1184,13 @@ export function AgentsPanel() {
 // ---------------------------------------------------------------------------
 // Sessions 面板
 // ---------------------------------------------------------------------------
-export function SessionsPanel({ onSelect }: { onSelect: (id: string) => void }) {
+export function SessionsPanel({
+  onSelect,
+  onDelete,
+}: {
+  onSelect: (id: string) => void;
+  onDelete?: (id: string) => void;
+}) {
   const [data, setData] = useState<any>({ sessions: [] });
   const load = () => apiFetch("/sessions").then((r) => r.json()).then(setData).catch(() => {});
   useEffect(() => {
@@ -1193,6 +1199,7 @@ export function SessionsPanel({ onSelect }: { onSelect: (id: string) => void }) 
 
   const del = async (id: string) => {
     await apiFetch(`/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+    onDelete?.(id);
     load();
   };
 

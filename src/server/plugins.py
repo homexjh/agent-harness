@@ -16,10 +16,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import FileResponse
 
 from .config import DATA_HOME
+from .auth import require_auth
 from pydantic import BaseModel, Field
 
 from .graph_provider import get_context_manager, reset_context_manager
@@ -286,12 +287,12 @@ def _tool_state(name: str, state: dict | None = None) -> dict:
 
 
 @router.get("/tools")
-def tools_list():
+def tools_list(user_id: str = Depends(require_auth)):
     """返回当前 harness 已注册工具及其 JSONSchema，附带启用/配置状态。"""
     from .graph_provider import _build_tools
 
     root = _workspace_dir()
-    cm = get_context_manager()
+    cm = get_context_manager(user_id)
     tools = _build_tools(str(root), cm, filter_disabled=False)
     state = _tools_state()
     result = []
@@ -951,9 +952,10 @@ def heartbeat():
 # Sessions 会话列表（从内存 checkpointer 读取 threads）
 # ---------------------------------------------------------------------------
 @router.get("/sessions")
-def sessions_list():
-    """返回最近活跃的会话列表（来自持久化的会话索引 sessions.json）。
+def sessions_list(user_id: str = Depends(require_auth)):
+    """返回当前用户最近活跃的会话列表（来自持久化的会话索引 sessions.json）。
 
+    多用户隔离：只返回归属当前 user_id 的会话（每个会话索引写入时记录 user_id）。
     历史真相源是会话索引文件（开对话时由 _touch_session 维护），不再从 checkpointer
     枚举——checkpoint 已落盘到 DATA_HOME/checkpoints.sqlite（~/.agent-harness），由 get_shared_checkpointer 管理。
     """
@@ -962,36 +964,43 @@ def sessions_list():
     if idx.exists():
         data = json.loads(idx.read_text(encoding="utf-8"))
         for tid, meta in data.get("threads", {}).items():
+            if meta.get("user_id", "default") != user_id:
+                continue
             threads.append({"id": tid, "updated_at": meta.get("updated_at", 0), "title": meta.get("title", tid)})
     threads.sort(key=lambda x: x["updated_at"], reverse=True)
     return {"sessions": threads}
 
 
-def _touch_session(tid: str, title: str = "") -> None:
+def _touch_session(tid: str, title: str = "", user_id: str = "default") -> None:
+    """维护会话索引（按用户隔离）。会话索引键为原始 tid，并附加 user_id 字段供列表过滤。"""
     p = _db_path("sessions.json")
     data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"threads": {}}
     data["threads"][tid] = {
         "updated_at": int(time.time()),
         "title": title or data["threads"].get(tid, {}).get("title", tid),
+        "user_id": user_id,
     }
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 @router.delete("/sessions/{tid}")
-async def sessions_delete(tid: str):
+async def sessions_delete(tid: str, user_id: str = Depends(require_auth)):
+    """删除某会话：从会话索引剔除，并清理复合键对应的 checkpointer 落盘状态。"""
     p = _db_path("sessions.json")
     if p.exists():
         data = json.loads(p.read_text(encoding="utf-8"))
         data["threads"].pop(tid, None)
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    # 清理 checkpointer（落盘 SQLite）中的 thread 状态，避免脏状态复活
+    # 清理 checkpointer（落盘 SQLite）中的 thread 状态，避免脏状态复活。
+    # 用复合键 user:thread —— 与聊天路径写入的 checkpoint 键一致，否则删不掉。
     from .graph_provider import get_shared_checkpointer
 
     cp = get_shared_checkpointer()
+    ck = f"{user_id}:{tid}"
     try:
-        await cp.adelete_thread(tid)
+        await cp.adelete_thread(ck)
     except Exception:  # noqa: BLE001
-        logger.warning("sessions_delete clear checkpoint failed tid=%s", tid)
+        logger.warning("sessions_delete clear checkpoint failed ck=%s", ck)
     return {"ok": True}
 
 
@@ -1012,15 +1021,18 @@ class MemoryAutoPayload(BaseModel):
 
 
 @router.get("/memory/config")
-def memory_config_get():
-    """返回当前 Memory Manager 配置（runtime.json running 段单一事实源）。"""
+def memory_config_get(user_id: str = Depends(require_auth)):
+    """返回当前 Memory Manager 配置（runtime.json running 段单一事实源，引擎级全局共享）。"""
     cfg = memory_mod.runtime_memory_config()
     return cfg.model_dump()
 
 
 @router.put("/memory/config")
-def memory_config_put(payload: MemoryConfigPayload):
-    """保存 Memory Manager 配置（写入 runtime.json running 段）并（重新）调度 dream cron。"""
+def memory_config_put(payload: MemoryConfigPayload, user_id: str = Depends(require_auth)):
+    """保存 Memory Manager 配置（写入 runtime.json running 段）并（重新）调度 dream cron。
+
+    记忆 vault 与镜像配置 memory_config.json 按用户隔离（user_id）。
+    """
     cfg = memory_mod.MemoryManagerConfig(**payload.config)
     # 主源：runtime.json 的 running 段（与 QwenPaw 对齐，UI 修改真实生效）
     try:
@@ -1036,8 +1048,8 @@ def memory_config_put(payload: MemoryConfigPayload):
         )
     except Exception as e:  # noqa: BLE001
         print(f"[memory] runtime config save failed: {e}")
-    # 镜像到 memory_config.json（向后兼容旧代码/手动读取）
-    memory_mod.save_config(cfg)
+    # 镜像到 memory_config.json（向后兼容旧代码/手动读取，按用户隔离）
+    memory_mod.save_config(cfg, user_id)
     # 重置单例，使下次访问用新配置重建
     memory_mod.reset_memory_manager()
     # 按 dream_cron 重新调度
@@ -1049,18 +1061,18 @@ def memory_config_put(payload: MemoryConfigPayload):
 
 
 @router.get("/memory/stats")
-def memory_stats_get():
+def memory_stats_get(user_id: str = Depends(require_auth)):
     """返回记忆 vault 统计（笔记数、索引块数、嵌入是否启用、上次 dream）。"""
-    mm = memory_mod.get_memory_manager()
+    mm = memory_mod.get_memory_manager(user_id)
     if mm is None:
         return {"enabled": False, "backend": memory_mod.runtime_memory_config().backend}
     return {"enabled": True, **mm.stats()}
 
 
 @router.post("/memory/search")
-def memory_search_ep(payload: MemorySearchPayload):
-    """调试用：直接对记忆 vault 做混合检索。"""
-    mm = memory_mod.get_memory_manager()
+def memory_search_ep(payload: MemorySearchPayload, user_id: str = Depends(require_auth)):
+    """调试用：直接对记忆 vault 做混合检索（按用户隔离）。"""
+    mm = memory_mod.get_memory_manager(user_id)
     if mm is None:
         return {"enabled": False, "results": []}
     results = mm.vault.hybrid_search(payload.query, payload.max_results)
@@ -1068,18 +1080,18 @@ def memory_search_ep(payload: MemorySearchPayload):
 
 
 @router.post("/memory/dream")
-def memory_dream_ep():
-    """手动触发一次 dream（整合/去重记忆）。"""
-    mm = memory_mod.get_memory_manager()
+def memory_dream_ep(user_id: str = Depends(require_auth)):
+    """手动触发一次 dream（整合/去重记忆，按用户隔离）。"""
+    mm = memory_mod.get_memory_manager(user_id)
     if mm is None:
         return {"enabled": False, "ok": False, "error": "memory disabled"}
     return mm.dream()
 
 
 @router.post("/memory/reindex")
-def memory_reindex_ep():
-    """重建记忆索引（扫描 vault 并重新嵌入）。"""
-    mm = memory_mod.get_memory_manager()
+def memory_reindex_ep(user_id: str = Depends(require_auth)):
+    """重建记忆索引（扫描 vault 并重新嵌入，按用户隔离）。"""
+    mm = memory_mod.get_memory_manager(user_id)
     if mm is None:
         return {"enabled": False, "ok": False, "error": "memory disabled"}
     n = mm.vault.rebuild_index()
@@ -1087,9 +1099,9 @@ def memory_reindex_ep():
 
 
 @router.post("/memory/auto-memory")
-def memory_auto_ep(payload: MemoryAutoPayload):
-    """手动把一段对话写入每日笔记（auto_memory 的显式触发）。"""
-    mm = memory_mod.get_memory_manager()
+def memory_auto_ep(payload: MemoryAutoPayload, user_id: str = Depends(require_auth)):
+    """手动把一段对话写入每日笔记（auto_memory 的显式触发，按用户隔离）。"""
+    mm = memory_mod.get_memory_manager(user_id)
     if mm is None:
         return {"enabled": False, "ok": False, "error": "memory disabled"}
     before = mm.vault.stats().get("notes", 0)
@@ -1106,31 +1118,34 @@ class ContextConfigPayload(BaseModel):
 
 
 @router.get("/context/config")
-def context_config_get():
-    """返回当前 Context Manager 配置（镜像 QwenPaw LightContextCard 配置面）。"""
-    return cc_mod.load_config().model_dump()
+def context_config_get(user_id: str = Depends(require_auth)):
+    """返回当前 Context Manager 配置（按用户隔离，镜像 QwenPaw LightContextCard 配置面）。"""
+    return cc_mod.load_config(user_id).model_dump()
 
 
 @router.put("/context/config")
-def context_config_put(payload: ContextConfigPayload):
-    """保存 Context Manager 配置并重置单例，使下次访问用新配置重建。"""
+def context_config_put(payload: ContextConfigPayload, user_id: str = Depends(require_auth)):
+    """保存 Context Manager 配置并重置单例，使下次访问用新配置重建（按用户隔离）。"""
     cfg = cc_mod.ContextManagerConfig(**payload.config)
-    cc_mod.save_config(cfg)
+    cc_mod.save_config(cfg, user_id)
     reset_context_manager()
     return cfg.model_dump()
 
 
 @router.get("/context/threads")
-def context_threads_get():
-    """列出当前进程内出现过 turn 的所有 thread_id。"""
-    cm = get_context_manager()
+def context_threads_get(user_id: str = Depends(require_auth)):
+    """列出当前用户进程内出现过 turn 的所有 thread_id（复合键）。"""
+    cm = get_context_manager(user_id)
     return {"threads": cm.thread_ids()}
 
 
 @router.get("/context/inspect")
-def context_inspect_get(thread_id: str = ""):
-    """检视某 thread 的折叠情况与存储全文（无 thread_id 时返回配置摘要 + thread 列表）。"""
-    cm = get_context_manager()
+def context_inspect_get(thread_id: str = "", user_id: str = Depends(require_auth)):
+    """检视某 thread 的折叠情况与存储全文（无 thread_id 时返回配置摘要 + thread 列表）。
+
+    存储键为复合键 user:thread，故检视某具体 thread 时按当前用户拼出复合键。
+    """
+    cm = get_context_manager(user_id)
     if not thread_id:
         return {
             "budget_tokens": cm.budget_tokens,
@@ -1139,16 +1154,16 @@ def context_inspect_get(thread_id: str = ""):
             "recall_enabled": cm.allow_unsandboxed_recall,
             "threads": cm.thread_ids(),
         }
-    return cm.inspect(thread_id)
+    return cm.inspect(f"{user_id}:{thread_id}")
 
 
 @router.post("/context/clear")
-def context_clear_post(thread_id: str = ""):
-    """清空指定 thread 的存储 turn（折叠区原文一并丢弃，无法再 recall）。"""
+def context_clear_post(thread_id: str = "", user_id: str = Depends(require_auth)):
+    """清空指定 thread 的存储 turn（折叠区原文一并丢弃，无法再 recall，按用户隔离）。"""
     if not thread_id:
         return {"ok": False, "error": "thread_id required"}
-    cm = get_context_manager()
-    n = cm.clear(thread_id)
+    cm = get_context_manager(user_id)
+    n = cm.clear(f"{user_id}:{thread_id}")
     return {"ok": True, "thread_id": thread_id, "removed": n}
 
 

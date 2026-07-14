@@ -932,7 +932,9 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True)
         RuleBasedGuardian(allowlist={"exec"}),
     ])
     guarded.update(make_guarded_tools([exec_tool], exec_engine))
-    guarded["recall"] = make_recall_tool(cm)
+    # recall 不绑定具体 cm：调用时按当前用户上下文现取，实现多用户隔离
+    # （图是 (model,mode) 单例，不能把某用户的 ContextManager 编译进工具）。
+    guarded["recall"] = make_recall_tool()
     # 长期记忆工具：memory_search（对齐 QwenPaw 的 ReMeLight memory_search）
     mm = get_memory_manager()
     if mm is not None:
@@ -945,7 +947,7 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True)
 
 _graph = None
 _metrics = None
-_cm = None
+_cm: dict = {}  # 按用户隔离的 ContextManager 缓存 {user_id: ContextManager}
 _built_version = -1  # 配置版本：变化时重建图（换模型/key 即时生效）
 _shared_checkpointer = None  # 所有图共享，保证多会话历史跨模型/请求持久，且 HITL 可恢复
 _request_graph_cache: dict = {}
@@ -959,16 +961,19 @@ def get_metrics() -> Metrics:
     return _metrics
 
 
-def get_context_manager() -> ContextManager:
+def get_context_manager(user_id: str | None = None) -> ContextManager:
     global _cm
-    if _cm is None:
+    from .user_ctx import get_user
+
+    uid = user_id or get_user()
+    if uid not in _cm:
         # 默认启用受控召回：recall 是 agent 在**同一 thread 内**的显式动作，
         # 只还原本会话自己折叠的历史，不跨会话，属安全操作。可用 env 关闭。
         recall_on = os.getenv("ALLOW_UNSANDBOXED_RECALL", "1") == "1"
         from .context_config import load_config as load_context_config
 
-        cfg = load_context_config()
-        _cm = ContextManager(
+        cfg = load_context_config(uid)
+        _cm[uid] = ContextManager(
             budget_tokens=int(os.getenv("CONTEXT_BUDGET", str(cfg.budget_tokens))),
             allow_unsandboxed_recall=(
                 cfg.enable_recall if os.getenv("ALLOW_UNSANDBOXED_RECALL") is None else recall_on
@@ -977,13 +982,13 @@ def get_context_manager() -> ContextManager:
             max_tool_result_chars=cfg.max_tool_result_chars,
             metrics=get_metrics(),
         )
-    return _cm
+    return _cm[uid]
 
 
 def reset_context_manager() -> None:
-    """清掉单例，使下次访问按最新 context_config.json 重建。"""
+    """清掉按用户缓存的 ContextManager，使下次访问按最新 context_config.json 重建。"""
     global _cm
-    _cm = None
+    _cm = {}
 
 
 def _checkpoint_db_path() -> Path:

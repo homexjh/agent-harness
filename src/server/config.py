@@ -294,7 +294,7 @@ class RuntimeConfig:
         "reasoning": False,
     })
     service: Dict[str, Any] = field(default_factory=lambda: {"api_key": ""})
-    security: Dict[str, Any] = field(default_factory=lambda: {"enable_auth": False})
+    security: Dict[str, Any] = field(default_factory=lambda: {"enable_auth": False, "users": []})
     rate_limit: int = 60  # 每分钟每 IP 上限；0 = 关闭（HTTP 端点限流）
     rate_limiter: Dict[str, Any] = field(default_factory=lambda: {
         "enabled": False,
@@ -318,7 +318,7 @@ class RuntimeConfig:
 def _normalize(cfg_dict: Dict[str, Any]) -> Dict[str, Any]:
     """补齐缺省字段 + 旧版 runtime.json 向后兼容迁移。"""
     cfg_dict = cfg_dict or {}
-    security = {**{"enable_auth": False}, **(cfg_dict.get("security") or {})}
+    security = {**{"enable_auth": False, "users": []}, **(cfg_dict.get("security") or {})}
     service = {**{"api_key": ""}, **(cfg_dict.get("service") or {})}
     # 关闭鉴权时自动清空服务令牌，避免前后端状态不一致导致保存死锁
     if not security.get("enable_auth"):

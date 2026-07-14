@@ -30,7 +30,12 @@ import {
 // ===========================================================================
 
 const API_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8123";
-const SESSIONS_KEY = "harness_sessions_v1";
+// 会话按用户命名空间隔离：多用户共享同一浏览器/Origin 时不串台
+const AUTH_TOKEN_KEY = "ah_auth_token";
+const AUTH_USER_KEY = "ah_user";
+const LEGACY_SESSIONS_KEY = "harness_sessions_v1";
+const SESSIONS_KEY = () =>
+  `harness_sessions_v1_${localStorage.getItem(AUTH_USER_KEY) || "default"}`;
 const BRAND_NAME = "Agent Harness";
 const BRAND_VERSION = "v0.1.0";
 const BRAND_LOGO = "🐾";
@@ -166,10 +171,37 @@ function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+// 读取当前用户的本地会话缓存（含消息，用于显示持久化），兼容旧版全局 key
+function readLocalSessions(): Session[] {
+  try {
+    const user = localStorage.getItem(AUTH_USER_KEY) || "default";
+    let raw = localStorage.getItem(`harness_sessions_v1_${user}`);
+    if ((!raw || raw === "[]") && user === "default") {
+      raw = localStorage.getItem(LEGACY_SESSIONS_KEY);
+    }
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && Array.isArray(parsed)) {
+      // 兼容旧格式：reasoning 从 string 迁移为 string[]
+      for (const s of parsed) {
+        for (const m of s.messages || []) {
+          if (m.role === "ai" && typeof m.reasoning === "string") {
+            m.reasoning = m.reasoning ? [m.reasoning] : [];
+          }
+        }
+      }
+      return parsed;
+    }
+  } catch {}
+  return [];
+}
+
 function apiFetch(path: string, opts: any = {}) {
-  const token = localStorage.getItem("svc_token") || "";
+  const authToken = localStorage.getItem("ah_auth_token") || "";
+  const svcToken = localStorage.getItem("svc_token") || "";
   const headers: any = { ...(opts.headers || {}) };
-  if (token) headers["x-api-key"] = token;
+  // 多用户鉴权：优先携带登录签发的 Bearer 令牌；未登录时退回旧的 service key 模式。
+  if (authToken) headers["Authorization"] = "Bearer " + authToken;
+  else if (svcToken) headers["x-api-key"] = svcToken;
   return fetch(API_URL + path, { ...opts, headers });
 }
 
@@ -271,25 +303,8 @@ export default function App() {
   const [agents, setAgents] = useState<any[]>([]);
   const [currentAgent, setCurrentAgent] = useState<any>({ id: "default", name: "Default Agent", emoji: "🤖" });
 
-  // 会话与状态
-  const [sessions, setSessions] = useState<Session[]>(() => {
-    try {
-      const raw = localStorage.getItem(SESSIONS_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        // 兼容旧格式：reasoning 从 string 迁移为 string[]
-        for (const s of parsed) {
-          for (const m of s.messages || []) {
-            if (m.role === "ai" && typeof m.reasoning === "string") {
-              m.reasoning = m.reasoning ? [m.reasoning] : [];
-            }
-          }
-        }
-        return parsed;
-      }
-    } catch {}
-    return [];
-  });
+  // 会话与状态（按当前用户命名空间持久化在 localStorage）
+  const [sessions, setSessions] = useState<Session[]>(() => readLocalSessions());
   const [activeId, setActiveId] = useState<string>("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [metrics, setMetrics] = useState<any>(null);
@@ -347,6 +362,15 @@ export default function App() {
   const [settingsMsg, setSettingsMsg] = useState<string | null>(null);
   const [authEnabled, setAuthEnabled] = useState(false);
 
+  // 多用户鉴权状态
+  const [authToken, setAuthToken] = useState<string>(() => localStorage.getItem(AUTH_TOKEN_KEY) || "");
+  const [authUser, setAuthUser] = useState<string>(() => localStorage.getItem(AUTH_USER_KEY) || "default");
+  const [showLogin, setShowLogin] = useState<boolean>(false);
+  const [loginMsg, setLoginMsg] = useState<string | null>(null);
+  const [loginLoading, setLoginLoading] = useState(false);
+  // 登录成功后触发配置/模型等重新拉取
+  const [cfgReload, setCfgReload] = useState(0);
+
   // 流式相关
   const [streaming, setStreaming] = useState(false);
   const activeIdRef = useRef(activeId);
@@ -363,17 +387,36 @@ export default function App() {
     localStorage.setItem("harness_view", view);
   }, [view]);
 
-  // 初始化：无会话则建一个
+  // 初始化：探测鉴权开关；必要时展示登录页；否则确保至少有一个会话
   useEffect(() => {
-    setSessions((prev) => {
-      if (prev.length) {
-        if (!activeId) setActiveId(prev[0].id);
-        return prev;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await apiFetch("/auth/status");
+        const d = await r.json().catch(() => ({ enable_auth: false }));
+        if (cancelled) return;
+        const enabled = !!d.enable_auth;
+        setAuthEnabled(enabled);
+        if (enabled && !localStorage.getItem(AUTH_TOKEN_KEY)) {
+          setShowLogin(true);
+          return;
+        }
+      } catch {
+        // 后端不可达：按无鉴权处理，允许纯本地使用
       }
-      const s: Session = { id: uid(), title: "新对话", messages: [], updatedAt: Date.now() };
-      setActiveId(s.id);
-      return [s];
-    });
+      if (cancelled) return;
+      const local = readLocalSessions();
+      if (local.length) {
+        setSessions(local);
+        if (!activeId) setActiveId(local[0].id);
+      } else {
+        await newSession();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 持久化会话（防抖：流式输出时每 token 都会改 sessions，
@@ -385,7 +428,7 @@ export default function App() {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
       try {
-        localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
+        localStorage.setItem(SESSIONS_KEY(), JSON.stringify(sessions));
       } catch {}
     }, 800);
     return () => {
@@ -398,11 +441,79 @@ export default function App() {
     [sessions, activeId]
   );
 
-  const newSession = useCallback(() => {
-    const s: Session = { id: uid(), title: "新对话", messages: [], updatedAt: Date.now() };
-    setSessions((prev) => [s, ...prev]);
-    setActiveId(s.id);
+  // 新建会话：先向后端注册（归属当前用户，写入 sessions 索引），
+  // 用后端返回的 thread_id 作为本地会话 id，保证聊天 thread 与后端一致。
+  const newSession = useCallback(async (): Promise<string> => {
+    let id = uid();
+    try {
+      const r = await apiFetch("/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (r.ok) {
+        const d = await r.json().catch(() => ({}));
+        if (d.id) id = d.id;
+      }
+    } catch {
+      // 后端不可达时退化为纯本地会话（仍可用，但不进后端索引）
+    }
+    const s: Session = { id, title: "新对话", messages: [], updatedAt: Date.now() };
+    setSessions((prev) => [s, ...prev.filter((x) => x.id !== id)]);
+    setActiveId(id);
     setView("chat");
+    return id;
+  }, []);
+
+  // 登录：校验用户名/密码，成功后保存令牌并重新加载该用户的会话
+  const doLogin = async (username: string, password: string) => {
+    setLoginLoading(true);
+    setLoginMsg(null);
+    try {
+      const r = await fetch(API_URL + "/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.token) {
+        localStorage.setItem(AUTH_TOKEN_KEY, d.token);
+        localStorage.setItem(AUTH_USER_KEY, d.user_id || username);
+        setAuthToken(d.token);
+        setAuthUser(d.user_id || username);
+        setShowLogin(false);
+        setCfgReload((x) => x + 1); // 重新拉取配置/模型（带新令牌）
+        const local = readLocalSessions();
+        if (local.length) {
+          setSessions(local);
+          setActiveId(local[0].id);
+        } else {
+          await newSession();
+        }
+      } else {
+        setLoginMsg(d.error || "登录失败");
+      }
+    } catch (e: any) {
+      setLoginMsg("登录请求失败：" + String(e?.message || e));
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  // 退出登录：清除令牌，回到登录页
+  const doLogout = () => {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    localStorage.removeItem(AUTH_USER_KEY);
+    setAuthToken("");
+    setAuthUser("default");
+    setSessions([]);
+    setShowLogin(true);
+  };
+
+  // 删除会话：同步清除本地缓存 + 通知后端
+  const deleteSession = useCallback((id: string) => {
+    setSessions((prev) => prev.filter((s) => s.id !== id));
+    apiFetch(`/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
   }, []);
 
   // 批量更新：流式 token 事件频率很高（每 token 一次 updateMsg），
@@ -442,7 +553,7 @@ export default function App() {
     }, 80);  // 80ms 合并窗口：减少流式重渲染频率（原 40ms=25次/s → 80ms=12次/s），人眼无感知差异但 UI 不抖
   }, []);
 
-  // 拉取配置回填 + 厂商目录
+  // 拉取配置回填 + 厂商目录（登录后 cfgReload 变化会重新拉取）
   useEffect(() => {
     apiFetch("/config")
       .then((r) => r.json())
@@ -468,7 +579,7 @@ export default function App() {
         setAuthEnabled(!!d.security?.enable_auth);
       })
       .catch(() => {});
-  }, []);
+  }, [cfgReload]);
 
   // 指标轮询
   useEffect(() => {
@@ -917,7 +1028,11 @@ export default function App() {
   );
 
   return (
-    <div className="app">
+    <>
+      {showLogin && (
+        <LoginScreen loading={loginLoading} msg={loginMsg} onLogin={doLogin} />
+      )}
+      <div className="app">
       {/* ---------------- QwenPaw 风格全侧边栏 ---------------- */}
       <aside className="qwen-sidebar">
         <div className="qwen-brand">
@@ -927,6 +1042,14 @@ export default function App() {
             <div className="qwen-version">{BRAND_VERSION}</div>
           </div>
         </div>
+
+        {authEnabled && (
+          <div className="user-chip">
+            <span className="user-avatar">👤</span>
+            <span className="user-name">{authUser}</span>
+            <button className="user-logout" onClick={doLogout} title="退出登录">退出</button>
+          </div>
+        )}
 
         <div className="sidebar-top-sticky">
           <div className="agent-picker">
@@ -1035,7 +1158,7 @@ export default function App() {
           />
         )}
         {view === "channels" && <ChannelsPanel />}
-        {view === "sessions" && <SessionsPanel onSelect={enterSession} />}
+        {view === "sessions" && <SessionsPanel onSelect={enterSession} onDelete={deleteSession} />}
         {view === "cron" && <CronPanel />}
         {view === "heartbeat" && <HeartbeatPanel />}
         {view === "files" && <FilesPanel />}
@@ -1097,7 +1220,8 @@ export default function App() {
           onSave={saveSettings}
         />
       )}
-    </div>
+      </div>
+    </>
   );
 }
 
@@ -1448,6 +1572,59 @@ function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: strin
         onKeyDown={(e) => e.key === "Enter" && submit()}
       />
       <button onClick={submit} disabled={streaming || !input.trim()}>发送</button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 登录页（服务级鉴权开启时展示）
+// ---------------------------------------------------------------------------
+function LoginScreen({
+  loading,
+  msg,
+  onLogin,
+}: {
+  loading: boolean;
+  msg: string | null;
+  onLogin: (username: string, password: string) => void;
+}) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const submit = () => {
+    if (!username.trim() || !password) return;
+    onLogin(username.trim(), password);
+  };
+  return (
+    <div className="login-screen">
+      <div className="login-card">
+        <div className="login-logo">{BRAND_LOGO}</div>
+        <div className="login-title">{BRAND_NAME}</div>
+        <div className="login-sub">请登录以继续（多用户隔离）</div>
+        {msg && <div className="login-msg">{msg}</div>}
+        <label className="login-field">
+          <span>用户名</span>
+          <input
+            value={username}
+            autoFocus
+            onChange={(e) => setUsername(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && submit()}
+            placeholder="用户名"
+          />
+        </label>
+        <label className="login-field">
+          <span>密码</span>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && submit()}
+            placeholder="密码"
+          />
+        </label>
+        <button className="login-submit" onClick={submit} disabled={loading || !username.trim() || !password}>
+          {loading ? "登录中…" : "登录"}
+        </button>
+      </div>
     </div>
   );
 }
