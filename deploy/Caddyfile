@@ -1,0 +1,17 @@
+# 生产建议：用 Caddy 做 TLS 终止 + 反向代理（自动签发受信任证书）。
+# 安装：brew install caddy
+# 运行：caddy run --config deploy/Caddyfile
+#
+# Caddy 会为域名自动申请并续期 Let's Encrypt 证书；本地演示可用 `tls internal`。
+{
+    admin off
+    # 真实域名（自动 HTTPS）：
+    # example.com {
+    #     reverse_proxy localhost:8123
+    # }
+    # 本地自签演示：
+    :8443 {
+        tls internal
+        reverse_proxy localhost:8123
+    }
+}

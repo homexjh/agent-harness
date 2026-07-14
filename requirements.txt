@@ -1,0 +1,25 @@
+# 运行时底座（路线 A：LangGraph 自建图 + DeepAgents 模块当零件）
+langgraph>=0.2
+langchain-core>=0.3
+
+# 真实模型（DeepSeek / 任意 OpenAI 兼容）：验证需要
+langchain-openai>=0.1
+
+# 测试
+pytest>=7
+
+# HTTP 服务层（LangGraph Platform 兼容 + SSE）
+fastapi>=0.110
+uvicorn>=0.29
+
+# 插件/配件管理面板（Heartbeat 资源统计、Skills frontmatter 解析）
+psutil>=5.9
+pyyaml>=6
+
+# 定时任务调度（Cron Jobs 真正执行）
+apscheduler>=3.10
+
+# DeepAgents 零件（Phase 3+ 接入 filesystem/memory/subagent middleware 时启用）
+# 本地源码位于 /Users/xjh/Documents/projects/merge/deepagents，可改为可编辑安装：
+#   pip install -e /Users/xjh/Documents/projects/merge/deepagents/libs/deepagents
+# deepagents

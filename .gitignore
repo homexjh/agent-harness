@@ -1,0 +1,36 @@
+# Secrets / runtime config (may contain API keys)
+config/
+deploy/tls/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Node / frontend
+node_modules/
+dist/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# LangGraph SQLite checkpointer（持久化线程状态，运行时生成）
+checkpoints.sqlite
+*.sqlite
+
+# Env files（可能含密钥）
+.env
+frontend/.env
+.env.*
+
+# pytest cache
+.pytest_cache/
+
+# WorkBuddy 私有工作记录（agent 调试笔记，非工程源码）
+.workbuddy/memory/
+
+# Vite 临时配置产物
+vite.config.ts.timestamp-*.mjs
