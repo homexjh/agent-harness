@@ -572,7 +572,10 @@ class CoreFilesManager:
         for name in CORE_FILE_NAMES:
             path = self._file_path(name)
             if not path.exists():
-                path.write_text("", encoding="utf-8")
+                # 根因修复：缺失文件创建时直接写入内置模板，杜绝被触空成 0 字节。
+                # 已存在的文件（含用户主动清空的 HEARTBEAT.md）一律不触碰。
+                content = DEFAULT_TEMPLATES.get("zh", {}).get(name, "")
+                path.write_text(content, encoding="utf-8")
             stat = path.stat()
             result.append(
                 {
