@@ -17,15 +17,17 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -174,11 +176,14 @@ def runtime_memory_config() -> MemoryManagerConfig:
 
 
 # ---------------------------------------------------------------------------
-# 嵌入客户端（OpenAI 兼容，仅标准库）
+# 嵌入客户端（OpenAI 兼容，仅标准库，带 LRU 缓存）
 # ---------------------------------------------------------------------------
 class EmbeddingClient:
     def __init__(self, cfg: EmbeddingModelConfig):
         self.cfg = cfg
+        self._cache: OrderedDict[str, list[float]] = OrderedDict()
+        self._cache_hits = 0
+        self._cache_misses = 0
 
     def is_enabled(self) -> bool:
         c = self.cfg
@@ -192,36 +197,89 @@ class EmbeddingClient:
             return bool(c.base_url.strip())
         return False
 
+    def _cache_key(self, text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     def _base_url(self) -> str:
         base = (self.cfg.base_url or "").strip().rstrip("/")
         if not base:
             base = "https://api.openai.com/v1"
         return base + "/embeddings"
 
-    def embed(self, texts: list[str]) -> Optional[list[list[float]]]:
-        if not self.is_enabled() or not texts:
-            return None
+    def _fetch(self, texts: Sequence[str]) -> Optional[list[list[float]]]:
         import urllib.request
 
         c = self.cfg
         headers = {"Content-Type": "application/json"}
         if c.backend == "ollama":
-            # ollama 兼容模式下也走 Bearer（空 key 亦可）
             headers["Authorization"] = "Bearer " + (c.api_key or "ollama")
         else:
             headers["Authorization"] = "Bearer " + (c.api_key or "")
-        payload = json.dumps(
-            {"input": texts, "model": c.model_name}
-        ).encode("utf-8")
+        payload = json.dumps({"input": list(texts), "model": c.model_name}).encode("utf-8")
         req = urllib.request.Request(self._base_url(), data=payload, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             return [d["embedding"] for d in data["data"]]
         except Exception as e:  # noqa: BLE001
-            # 嵌入失败时降级为 None（纯 BM25 检索仍可用）
             print(f"[memory] embedding failed: {e}")
             return None
+
+    def _enforce_cache_size(self) -> None:
+        limit = max(0, self.cfg.max_cache_size)
+        if limit <= 0:
+            self._cache.clear()
+            return
+        while len(self._cache) > limit:
+            self._cache.popitem(last=False)
+
+    def embed(self, texts: Sequence[str]) -> Optional[list[list[float]]]:
+        if not self.is_enabled() or not texts:
+            return None
+        texts = list(texts)
+        results: list[Optional[list[float]]] = [None] * len(texts)
+        missing: list[tuple[int, str]] = []
+
+        for i, text in enumerate(texts):
+            if self.cfg.enable_cache:
+                key = self._cache_key(text)
+                cached = self._cache.get(key)
+                if cached is not None:
+                    results[i] = cached
+                    self._cache_hits += 1
+                    self._cache.move_to_end(key)
+                    continue
+            missing.append((i, text))
+
+        if missing:
+            batch = [text for _, text in missing]
+            fetched = self._fetch(batch)
+            if fetched is None:
+                return None
+            if len(fetched) != len(missing):
+                print(
+                    f"[memory] embedding batch size mismatch: "
+                    f"expected {len(missing)}, got {len(fetched)}"
+                )
+                return None
+            for (orig_idx, text), emb in zip(missing, fetched):
+                results[orig_idx] = emb
+                if self.cfg.enable_cache:
+                    key = self._cache_key(text)
+                    self._cache[key] = emb
+                    self._cache.move_to_end(key)
+            self._cache_misses += len(missing)
+            self._enforce_cache_size()
+
+        return [r for r in results if r is not None]
+
+    def cache_stats(self) -> dict:
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "size": len(self._cache),
+            "limit": max(0, self.cfg.max_cache_size),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +337,55 @@ class MemoryVault:
             encoding="utf-8",
         )
 
+    def _update_index_for_rel(self, rel_path: str, content: str) -> None:
+        """增量更新单个文件的索引：只 embed 该文件变更的 chunk。
+
+        通过 content hash 判断文件是否变化；若未变化则直接跳过。
+        旧 chunk 按 path 移除，新 chunk 写入并替换 embedding。
+        """
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        old_chunks = [c for c in self._index if c["path"] == rel_path]
+        unchanged = old_chunks and all(c.get("source_hash") == content_hash for c in old_chunks)
+        needs_embed_backfill = (
+            self.embedding.is_enabled()
+            and old_chunks
+            and any(c.get("embedding") is None for c in old_chunks)
+        )
+        if unchanged and not needs_embed_backfill:
+            return
+        # 移除该文件旧 chunk
+        self._index = [c for c in self._index if c["path"] != rel_path]
+        if not content.strip():
+            self._save_index()
+            return
+        # 生成新 chunk 并批量嵌入
+        new_chunks: list[dict] = []
+        chunk_texts: list[str] = []
+        for ch in self._chunk_text(content):
+            new_chunks.append(
+                {
+                    "path": rel_path,
+                    "text": ch,
+                    "tokens": _tokenize(ch),
+                    "embedding": None,
+                    "source_hash": content_hash,
+                }
+            )
+            chunk_texts.append(ch)
+        if self.embedding.is_enabled() and chunk_texts:
+            bs = max(1, self.embedding.cfg.max_batch_size)
+            for i in range(0, len(chunk_texts), bs):
+                batch = chunk_texts[i : i + bs]
+                res = self.embedding.embed(batch)
+                if res:
+                    for j, e in enumerate(res):
+                        new_chunks[i + j]["embedding"] = e
+        self._index.extend(new_chunks)
+        self._save_index()
+
     def _chunk_text(self, text: str, size: int = 600, overlap: int = 80) -> list[str]:
+        # 跳过 YAML frontmatter，避免把元数据切成噪声 chunk 污染检索
+        text = re.sub(r"^---\s*\n[\s\S]*?\n---\s*\n", "", text, count=1)
         paras = [p.strip() for p in re.split(r"\n{1,}|\n", text) if p.strip()]
         chunks: list[str] = []
         buf = ""
@@ -309,16 +415,17 @@ class MemoryVault:
             self._index = []
             files = self._scan_files()
             texts: list[str] = []
-            meta: list[tuple[str, str]] = []  # (relpath, chunk_text)
+            meta: list[tuple[str, str, str]] = []  # (relpath, chunk_text, content_hash)
             for f in files:
                 try:
                     content = f.read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     continue
                 rel = str(f.relative_to(self.root))
+                content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 for ch in self._chunk_text(content):
                     texts.append(ch)
-                    meta.append((rel, ch))
+                    meta.append((rel, ch, content_hash))
             # 批量嵌入（受 max_batch_size 限制）
             embeds: list[Optional[list[float]]] = [None] * len(texts)
             if self.embedding.is_enabled() and texts:
@@ -329,13 +436,14 @@ class MemoryVault:
                     if res:
                         for j, e in enumerate(res):
                             embeds[i + j] = e
-            for (rel, ch), e in zip(meta, embeds):
+            for (rel, ch, content_hash), e in zip(meta, embeds):
                 self._index.append(
                     {
                         "path": rel,
                         "text": ch,
                         "tokens": _tokenize(ch),
                         "embedding": e,
+                        "source_hash": content_hash,
                     }
                 )
             self._save_index()
@@ -349,22 +457,24 @@ class MemoryVault:
         block = f"\n## {ts}\n\n{section}\n"
         with self._lock:
             if path.exists():
-                path.write_text(path.read_text(encoding="utf-8") + block, encoding="utf-8")
+                content = path.read_text(encoding="utf-8") + block
             else:
-                path.write_text(
+                content = (
                     f"---\nname: {date}\ndescription: daily memory note\ndate: {date}\n---\n"
-                    + block,
-                    encoding="utf-8",
+                    + block
                 )
+            path.write_text(content, encoding="utf-8")
+            rel = str(path.relative_to(self.root))
+            self._update_index_for_rel(rel, content)
 
     def write_dream(self, content: str) -> None:
         self.dream_dir.mkdir(parents=True, exist_ok=True)
         path = self.dream_dir / "interests.md"
+        full = f"---\nname: interests\ndescription: consolidated memory (dream)\n---\n\n{content}\n"
         with self._lock:
-            path.write_text(
-                f"---\nname: interests\ndescription: consolidated memory (dream)\n---\n\n{content}\n",
-                encoding="utf-8",
-            )
+            path.write_text(full, encoding="utf-8")
+            rel = str(path.relative_to(self.root))
+            self._update_index_for_rel(rel, full)
 
     # ---- BM25 ----
     def _bm25(self, query_tokens: list[str]) -> list[float]:
@@ -504,8 +614,7 @@ class MemoryManager:
             if text.strip():
                 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 self.vault.add_daily_note(today, text)
-                # 写入后增量重建索引
-                self.vault.rebuild_index()
+                # add_daily_note 内部已做增量索引更新
         except Exception as e:  # noqa: BLE001
             print(f"[memory] auto_memory failed: {e}")
 
@@ -586,7 +695,7 @@ class MemoryManager:
             content = self._llm_dream(text) or ("# Dream (auto-consolidated)\n\n" + text[:2000])
             self.vault.write_dream(content)
             self._last_dream = datetime.now(timezone.utc).isoformat()
-            self.vault.rebuild_index()
+            # write_dream 内部已做增量索引更新
             return {"ok": True, "dreamed_at": self._last_dream}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": str(e)}
