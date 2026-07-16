@@ -1168,6 +1168,13 @@ body {
   overflow: hidden;
 }
 
+/* ---------------- Memory 面板（修复内容超出无法滚动） ---------------- */
+.memory-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 24px 28px;
+}
 /* ---------------- 插件面板通用 ---------------- */
 .plugin-panel {
   flex: 1;
