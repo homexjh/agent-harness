@@ -49,7 +49,8 @@ def _content_of(msg: dict) -> str:
 def _msg_tokens(msg: dict, count: Callable[[str], int]) -> int:
     content = _content_of(msg)
     t = count(content)
-    tc = msg.get("data", msg).get("additional_kwargs", {}).get("tool_calls")
+    data = msg.get("data", msg)
+    tc = data.get("tool_calls") or data.get("additional_kwargs", {}).get("tool_calls")
     if tc:
         t += count(json.dumps(tc, ensure_ascii=False)) // 4 + 50
     return t
@@ -92,21 +93,48 @@ class ContextManager:
         for i, msg in enumerate(raw_messages[existing:], start=existing + 1):
             self._store.append(thread_id, i, msg)
 
-    # ---- 折叠：保留最近窗口，折最旧 ----
+    # ---- 折叠：保留最近窗口，折最旧；必须把 assistant tool_calls 及其后续所有 ToolMessage 作为一个 block 整体折叠，避免破坏配对导致模型 400 ----
     def _fold(self, items: list):
         system = [it for it in items if it["msg"].get("type") == "system"]
         body = [it for it in items if it["msg"].get("type") != "system"]
+
+        # 1. 把 body 按 "tool call block" 分组：一个 assistant tool_calls + 紧随其后的所有 ToolMessage
+        blocks: list[list[dict]] = []
+        i = 0
+        while i < len(body):
+            it = body[i]
+            msg = it["msg"]
+            data = msg.get("data", msg)
+            tool_calls = data.get("tool_calls") or data.get("additional_kwargs", {}).get("tool_calls")
+            is_tool_call = msg.get("type") == "ai" and tool_calls
+            if is_tool_call:
+                block = [it]
+                j = i + 1
+                while j < len(body) and body[j]["msg"].get("type") == "tool":
+                    block.append(body[j])
+                    j += 1
+                blocks.append(block)
+                i = j
+            else:
+                blocks.append([it])
+                i += 1
+
+        # 2. 从后往前按 block 折叠，保证不拆分 tool call block
         budget = self.budget_tokens
-        kept, folded, acc = [], [], 0
-        for it in reversed(body):
-            t = _msg_tokens(it["msg"], self._count)
-            if not kept or acc + t <= budget:
-                kept.append(it)
+        kept_blocks, folded_blocks, acc = [], [], 0
+        for block in reversed(blocks):
+            t = sum(_msg_tokens(it["msg"], self._count) for it in block)
+            if not kept_blocks or acc + t <= budget:
+                kept_blocks.append(block)
                 acc += t
             else:
-                folded.append(it)
-        kept.reverse()
-        folded.reverse()
+                folded_blocks.append(block)
+        kept_blocks.reverse()
+        folded_blocks.reverse()
+
+        kept = [it for block in kept_blocks for it in block]
+        folded = [it for block in folded_blocks for it in block]
+
         window = [messages_from_dict([s["msg"]])[0] for s in system]
         if folded:
             window.append(self._make_stub(folded))
