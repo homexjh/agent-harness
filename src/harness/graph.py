@@ -20,7 +20,7 @@ logger = logging.getLogger("agent_harness.graph")
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from .agent import make_call_model
 from .context.manager import ContextManager
@@ -79,53 +79,48 @@ def make_context_node(context_manager: ContextManager, system_hint: str = None, 
         cm = get_context_manager(user_id)
         mm = get_memory_manager(user_id)
 
-        # Build final system hint: core files (layer-1) first, then mode-specific hint.
-        final_hint_parts = []
+        # 系统提示走可插拔贡献器管线（对齐 QwenPaw PromptManager）：
+        # 各贡献器按 priority 拼接，分别产出 workspace 文件 / mode hint /
+        # 长期记忆检索 / scroll 引导 / 环境时间。单贡献器异常不影响整体装配。
+        final_hint = None
         _t0 = time.perf_counter()
-        if core_files_manager is not None:
-            try:
-                core_prompt = core_files_manager.build_system_prompt()
-                if core_prompt:
-                    final_hint_parts.append(core_prompt)
-            except Exception as e:  # noqa: BLE001
-                print(f"[core-files] build_system_prompt failed: {e}")
-        if system_hint:
-            final_hint_parts.append(system_hint)
-        final_hint = "\n\n".join(final_hint_parts) if final_hint_parts else None
+        try:
+            from ..server.prompt_contributors import (
+                get_prompt_manager,
+                PromptContext,
+            )
+
+            pm = get_prompt_manager()
+            pctx = PromptContext(
+                user_id=user_id,
+                thread_id=thread_id,
+                messages=raw,
+                last_user_text=_last_human_text(raw),
+                core_files_manager=core_files_manager,
+                memory_manager=mm,
+                mode_hint=system_hint,
+            )
+            prompt_str = pm.build_sync(pctx)
+            if prompt_str:
+                final_hint = prompt_str
+        except Exception as e:  # noqa: BLE001
+            print(f"[prompt] assembly failed: {e}")
         logger.info("CTX_CORE thread=%s dt=%.3fs", thread_id, time.perf_counter() - _t0)
 
         _t1 = time.perf_counter()
         window, cstate = cm.prepare(raw, thread_id, system_hint=final_hint)
         logger.info("CTX_PREPARE thread=%s dt=%.3fs msgs=%d", thread_id, time.perf_counter() - _t1, len(raw))
 
-        # 长期记忆（对齐 QwenPaw 的 ReMeLight）：
-        # - auto_memory：按 auto_memory_interval 把对话事实写入 vault；
-        # - auto_memory_search：回复前用最新用户消息做混合检索，命中则注入系统提示。
+        # 长期记忆：只负责"写"（auto_memory 后台线程）；"读/检索注入"已交由
+        # MemoryContributor 在系统提示管线里完成，避免此处重复拼装。
         if mm is not None:
             try:
                 _t2 = time.perf_counter()
                 fut = _MEMORY_EXECUTOR.submit(mm.auto_memory, raw, thread_id=thread_id)
                 fut.add_done_callback(_log_memory_exception)
                 logger.info("CTX_AUTOMEM thread=%s dt=%.3fs", thread_id, time.perf_counter() - _t2)
-                ams = mm.cfg.reme_light_memory_config.auto_memory_search_config
-                if ams.enabled:
-                    _t3 = time.perf_counter()
-                    last_user = _last_human_text(raw)
-                    if last_user:
-                        hit = mm.memory_search(last_user, ams.max_results)
-                        if not hit.startswith(f"memory_search('{last_user}'): no"):
-                            window = [
-                                SystemMessage(
-                                    content=(
-                                        "## Retrieved long-term memory\n"
-                                        + hit
-                                        + "\n(Use this to inform your response when relevant.)"
-                                    )
-                                )
-                            ] + window
-                    logger.info("CTX_MEMSEARCH thread=%s dt=%.3fs", thread_id, time.perf_counter() - _t3)
             except Exception as e:  # noqa: BLE001
-                print(f"[memory] context hook failed: {e}")
+                print(f"[memory] auto_memory submit failed: {e}")
 
         # 把折叠后的窗口放到 prompt_messages，不要覆盖 messages。
         # 这样 agent 节点生成的 AIMessage 会被 add_messages reducer 追加到 messages，
