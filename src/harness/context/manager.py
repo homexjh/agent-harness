@@ -12,9 +12,35 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Callable, Optional
+
+
+def _cosine(a, b) -> float:
+    """余弦相似度；维度不等或零向量返回 0。"""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _embed_client_enabled(client) -> bool:
+    """鸭子检查 EmbeddingClient 是否可用（is_enabled() 为真）。"""
+    if client is None:
+        return False
+    fn = getattr(client, "is_enabled", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+    return False
 
 from langchain_core.messages import (
     AIMessage,
@@ -67,6 +93,10 @@ class ContextManager:
         allow_unsandboxed_recall: Optional[bool] = None,
         strip_media: bool = True,
         max_tool_result_chars: int = 0,
+        reserve_ratio: float = 0.2,
+        hard_stop_tokens: int = 300000,
+        embedding_client=None,
+        enable_semantic_recall: bool = True,
         metrics=None,
     ):
         self.budget_tokens = budget_tokens
@@ -80,6 +110,15 @@ class ContextManager:
         self.strip_media = strip_media
         # QwenPaw ToolResultPruningMiddleware 等效：工具结果超长则在窗口里截断（store 仍留全文）。
         self._max_tool_result_chars = max(0, int(max_tool_result_chars))
+        # 对齐 QwenPaw 保留区 + BudgetGate 硬停
+        self.reserve_ratio = max(0.0, min(1.0, float(reserve_ratio)))
+        self.hard_stop_tokens = max(0, int(hard_stop_tokens))
+        # 对齐 QwenPaw eviction index：被折 block 登记 seq->headline/tokens/embedding，
+        # 供 recall 精确还原（简化为按 seq 的扁平索引，非多层 carry 树）。
+        self._eviction_index: dict = {}
+        # 语义召回：可选 EmbeddingClient（鸭子类型 is_enabled()/embed()），复用 MemoryVault 实例。
+        self.embedding_client = embedding_client
+        self.enable_semantic_recall = enable_semantic_recall
         self._active_thread = None
         self._metrics = metrics
 
@@ -93,7 +132,10 @@ class ContextManager:
         for i, msg in enumerate(raw_messages[existing:], start=existing + 1):
             self._store.append(thread_id, i, msg)
 
-    # ---- 折叠：保留最近窗口，折最旧；必须把 assistant tool_calls 及其后续所有 ToolMessage 作为一个 block 整体折叠，避免破坏配对导致模型 400 ----
+    # ---- 折叠：保留最近窗口，折最旧；必须把 assistant tool_calls 及其后续所有 ToolMessage
+    # 作为一个 block 整体折叠，避免破坏配对导致模型 400。
+    # 对齐 QwenPaw：① reserve_ratio 保留区（最近窗口永折不动）② hard_stop 硬停兜底
+    # ③ 被折 block 登记进 _eviction_index，供 recall 精确/语义还原 ----
     def _fold(self, items: list):
         system = [it for it in items if it["msg"].get("type") == "system"]
         body = [it for it in items if it["msg"].get("type") != "system"]
@@ -119,42 +161,126 @@ class ContextManager:
                 blocks.append([it])
                 i += 1
 
-        # 2. 从后往前按 block 折叠，保证不拆分 tool call block
-        budget = self.budget_tokens
-        kept_blocks, folded_blocks, acc = [], [], 0
-        for block in reversed(blocks):
-            t = sum(_msg_tokens(it["msg"], self._count) for it in block)
-            if not kept_blocks or acc + t <= budget:
-                kept_blocks.append(block)
+        block_tokens = [sum(_msg_tokens(it["msg"], self._count) for it in b) for b in blocks]
+
+        # 2. 保留区：从最新 block 往前累计到 reserve_tokens，这些 block 永折不动
+        reserve_tokens = int(self.budget_tokens * self.reserve_ratio)
+        kept, acc = [], 0
+        for b, t in zip(reversed(blocks), reversed(block_tokens)):
+            kept.append(b)
+            acc += t
+            if acc >= reserve_tokens:
+                break
+        keep_ids = {id(b) for b in kept}
+
+        # 3. 软预算内，从新往旧继续容纳旧 block（保留区已含的不重复计）
+        for b, t in zip(reversed(blocks), reversed(block_tokens)):
+            if id(b) in keep_ids:
+                continue
+            if acc + t <= self.budget_tokens:
+                kept.append(b)
                 acc += t
             else:
-                folded_blocks.append(block)
-        kept_blocks.reverse()
-        folded_blocks.reverse()
+                break  # 更旧的 block 超出软预算，停止
+
+        # 4. 硬停兜底：若窗口仍超 hard_stop，继续折最旧直到 <= 硬停（极端配置才触发）
+        if self.hard_stop_tokens > 0 and acc > self.hard_stop_tokens:
+            new_kept, new_acc = [], 0
+            for b, t in zip(reversed(blocks), reversed(block_tokens)):
+                if new_acc + t <= self.hard_stop_tokens:
+                    new_kept.append(b)
+                    new_acc += t
+            kept, acc = new_kept, new_acc
+            keep_ids = {id(b) for b in kept}
+
+        # 5. 分类 kept/folded（按 block 原顺序）
+        kept_blocks = [b for b in blocks if id(b) in keep_ids]
+        folded_blocks = [b for b in blocks if id(b) not in keep_ids]
+
+        # 6. 登记被折 block 进 eviction index（含可选 embed 缓存）
+        self._register_eviction(folded_blocks)
 
         kept = [it for block in kept_blocks for it in block]
         folded = [it for block in folded_blocks for it in block]
 
         window = [messages_from_dict([s["msg"]])[0] for s in system]
-        if folded:
-            window.append(self._make_stub(folded))
+        if folded_blocks:
+            window.append(self._make_map_stub(folded_blocks))
             if self._metrics is not None:
                 folded_tok = sum(_msg_tokens(f["msg"], self._count) for f in folded)
                 self._metrics.fold(len(folded), folded_tok)
         window += [messages_from_dict([k["msg"]])[0] for k in kept]
         return window, [f["seq"] for f in folded]
 
-    def _make_stub(self, folded: list) -> SystemMessage:
-        seqs = [f["seq"] for f in folded]
-        first = _content_of(folded[0]["msg"])[:120].replace("\n", " ")
-        total_tok = sum(_msg_tokens(f["msg"], self._count) for f in folded)
-        content = (
-            f"{FOLD_STUB_MARKER} turns {seqs[0]}\u2013{seqs[-1]} "
-            f"({len(folded)} msgs, ~{total_tok} tok) folded to save context.\n"
-            f"Preview: {first}...\n"
-            f"Call recall(\"keyword\") to restore full content (preserved in store)."
+    # ---- 登记被折 block 进 eviction index（分层索引简化版：按 seq 精确记录 + 可选 embed 缓存）----
+    def _register_eviction(self, folded_blocks: list) -> None:
+        if not folded_blocks:
+            self._eviction_index.clear()
+            return
+        current = {it["seq"] for block in folded_blocks for it in block}
+        # 移除已不再被折的陈旧登记（仅在 current 内复用 embedding 缓存）
+        for seq in list(self._eviction_index.keys()):
+            if seq not in current:
+                del self._eviction_index[seq]
+        texts_to_embed, seq_for_text = [], []
+        for block in folded_blocks:
+            for it in block:
+                seq = it["seq"]
+                content = _content_of(it["msg"]).replace("\n", " ")
+                headline = content[:120] or f"(empty {it['msg'].get('type')})"
+                entry = self._eviction_index.get(seq, {})
+                entry["headline"] = headline
+                entry["tokens"] = _msg_tokens(it["msg"], self._count)
+                entry["type"] = it["msg"].get("type")
+                self._eviction_index[seq] = entry
+                # 仅首次 embed（命中缓存则跳过，不重复发请求）
+                if (
+                    self.enable_semantic_recall
+                    and self.embedding_client is not None
+                    and _embed_client_enabled(self.embedding_client)
+                    and entry.get("embedding") is None
+                ):
+                    texts_to_embed.append(content or headline)
+                    seq_for_text.append(seq)
+        if texts_to_embed:
+            try:
+                vecs = self.embedding_client.embed(texts_to_embed)
+                if vecs:
+                    for seq, vec in zip(seq_for_text, vecs):
+                        if vec:
+                            self._eviction_index[seq]["embedding"] = vec
+            except Exception:
+                pass  # 语义召回降级为 keyword，不影响折叠
+
+    def _make_map_stub(self, folded_blocks: list) -> SystemMessage:
+        # 把被折 block 合并成连续区段（对齐 QwenPaw EvictionIndex 的区段地图）
+        segments = []
+        for block in folded_blocks:
+            seqs = [it["seq"] for it in block]
+            first = _content_of(block[0]["msg"])[:80].replace("\n", " ")
+            segments.append((seqs[0], seqs[-1], len(block), first))
+        merged = []
+        for s0, s1, cnt, head in segments:
+            if merged and merged[-1][1] + 1 == s0:
+                merged[-1] = (merged[-1][0], s1, merged[-1][2] + cnt, merged[-1][3])
+            else:
+                merged.append((s0, s1, cnt, head))
+        total_msgs = sum(c for _, _, c, _ in merged)
+        total_tok = sum(
+            _msg_tokens(it["msg"], self._count)
+            for block in folded_blocks for it in block
         )
-        return SystemMessage(content=content, additional_kwargs={"kind": "fold_stub"})
+        lines = [
+            f"{FOLD_STUB_MARKER} {len(merged)} segment(s), {total_msgs} msgs, "
+            f"~{total_tok} tok folded to save context.",
+        ]
+        for s0, s1, cnt, head in merged:
+            rng = f"turns {s0}" if s0 == s1 else f"turns {s0}-{s1}"
+            lines.append(f"  - [{rng}] ({cnt}) {head}...")
+        lines.append(
+            'Call recall(seq=N) to restore a specific turn, or recall("keyword") to search.'
+        )
+        return SystemMessage(content="\n".join(lines), additional_kwargs={"kind": "fold_stub"})
 
     # ---- 媒体剥离：把历史里的 base64 图片/音视频从上下文摘掉省 token ----
     def _strip_media(self, window: list) -> list:
@@ -278,7 +404,8 @@ class ContextManager:
         return self._store.clear(thread_id)
 
     # ---- 召回：agent 显式调用，还原折叠区全文 ----
-    def recall(self, query: str, thread_id=None) -> str:
+    # seq= 精确还原某 seq 全文；query= 走语义 top-k（embedding）或 keyword 子串回退 ----
+    def recall(self, query: str = None, thread_id=None, seq=None, top_k: int = 3) -> str:
         tid = thread_id or self._active_thread
         if tid is None:
             return "recall: no active thread (call prepare first)."
@@ -288,7 +415,52 @@ class ContextManager:
                 "allow_unsandboxed_recall=True or env ALLOW_UNSANDBOXED_RECALL=1."
             )
         rows = self._store.all(tid)
-        q = (query or "").lower()
+
+        # 1) 精确 seq 还原（对齐 QwenPaw recall_history 的精确 seq 召回）
+        if seq is not None:
+            target = int(seq) if isinstance(seq, str) and str(seq).isdigit() else seq
+            for it in rows:
+                if it["seq"] == target:
+                    content = _content_of(it["msg"])
+                    if self._metrics is not None:
+                        self._metrics.recall(1)
+                    return f"recall(seq={seq}) restored:\n\n{content[:4000]}"
+            return f"recall: seq={seq} not found in store."
+
+        q = (query or "").strip().lower()
+        if not q:
+            return "recall: provide a seq or a query."
+
+        # 2) 语义召回：embedding 可用时走向量余弦 top-k（对齐 QwenPaw 语义 recall）
+        if (
+            self.enable_semantic_recall
+            and self.embedding_client is not None
+            and _embed_client_enabled(self.embedding_client)
+        ):
+            try:
+                qvec = self.embedding_client.embed([query])
+                if qvec and qvec[0]:
+                    scored = []
+                    for s, e in self._eviction_index.items():
+                        vec = e.get("embedding")
+                        if vec:
+                            scored.append((_cosine(qvec[0], vec), s))
+                    if scored:
+                        scored.sort(reverse=True)
+                        top = scored[: max(1, top_k)]
+                        out = [f"recall('{query}') semantic top-{len(top)}:"]
+                        for score, s in top:
+                            content = _content_of(
+                                next((it["msg"] for it in rows if it["seq"] == s), {})
+                            ) or self._eviction_index[s].get("headline", "")
+                            out.append(f"\n[score={score:.3f} seq={s}] {content[:2000]}")
+                        if self._metrics is not None:
+                            self._metrics.recall(len(top))
+                        return "\n".join(out)
+            except Exception:
+                pass  # 降级 keyword
+
+        # 3) keyword 子串回退（保持原有行为）
         matched = []
         for it in rows:
             content = _content_of(it["msg"])

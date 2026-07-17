@@ -45,14 +45,22 @@ CONFIG_PATH = _config_path()  # 兼容引用（默认用户）；实际读写走
 # 配置模型（镜像 QwenPaw LightContextCard）
 # ---------------------------------------------------------------------------
 class ContextManagerConfig(BaseModel):
-    # 上下文预算阈值（token）。超过后最旧 turns 折叠。
+    # 上下文预算阈值（token）。超过后最旧 turns 折叠（软预算）。
     budget_tokens: int = 8000
+    # 保留区比例：最近窗口至少保留 budget_tokens * reserve_ratio 的 token，永不被折
+    # （对齐 QwenPaw 的 reserve_ratio 保留区，避免关键近期上下文被挤掉）。
+    reserve_ratio: float = 0.2
+    # BudgetGate 硬停上限（token）：窗口 token 绝不可超过此值，超过则继续折最旧直至
+    # 达标。对齐 QwenPaw BudgetGate（默认 30 万）的兜底语义。
+    hard_stop_tokens: int = 300000
     # 允许 thread 内显式 recall 还原折叠历史。
     enable_recall: bool = True
     # 历史里的 base64 媒体从上下文剥离（省 token）。
     strip_media: bool = True
     # 工具结果裁剪上限（字符）。0 = 不裁剪。
     max_tool_result_chars: int = 0
+    # 语义召回：recall(query) 在有 embedding 时走向量余弦 top-k，否则回退 keyword。
+    enable_semantic_recall: bool = True
 
 
 def default_config() -> ContextManagerConfig:

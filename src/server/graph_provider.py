@@ -973,6 +973,12 @@ def get_context_manager(user_id: str | None = None) -> ContextManager:
         from .context_config import load_config as load_context_config
 
         cfg = load_context_config(uid)
+        # 复用 MemoryManager 的 EmbeddingClient 做语义召回（无 embedding 时传 None 自动降级 keyword）
+        embedding_client = None
+        try:
+            embedding_client = get_memory_manager(uid).vault.embedding
+        except Exception:
+            embedding_client = None
         _cm[uid] = ContextManager(
             budget_tokens=int(os.getenv("CONTEXT_BUDGET", str(cfg.budget_tokens))),
             allow_unsandboxed_recall=(
@@ -980,6 +986,10 @@ def get_context_manager(user_id: str | None = None) -> ContextManager:
             ),
             strip_media=cfg.strip_media,
             max_tool_result_chars=cfg.max_tool_result_chars,
+            reserve_ratio=cfg.reserve_ratio,
+            hard_stop_tokens=cfg.hard_stop_tokens,
+            embedding_client=embedding_client,
+            enable_semantic_recall=cfg.enable_semantic_recall,
             metrics=get_metrics(),
         )
     return _cm[uid]
