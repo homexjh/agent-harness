@@ -678,6 +678,14 @@ def get_core_files_manager() -> CoreFilesManager:
     global _cfm
     if _cfm is None:
         _cfm = CoreFilesManager()
+        # 自动确保内置模板已写入工作区：历史上 initialize_templates 未被
+        # 自动调用，导致 workspace 文件（AGENTS/SOUL/PROFILE…）在只走
+        # build_system_prompt 的路径下缺失、贡献器静默跳过。这里在单例
+        # 创建时幂等补齐（仅写缺失/0 字节文件，不触碰用户已有内容）。
+        try:
+            _cfm.initialize_templates("zh")
+        except Exception:  # noqa: BLE001
+            pass
     return _cfm
 
 
