@@ -75,6 +75,7 @@ def make_context_node(context_manager: ContextManager, system_hint: str = None, 
         # 注意：本项目以 src 为包根（start.sh 的 PYTHONPATH=项目根，uvicorn 跑 src.server.app），
         # 故必须用相对导入 ..server，绝对 import server 在运行时解析不到（No module named 'server'）。
         from ..server.graph_provider import get_context_manager, get_memory_manager
+        from ..server.config import get_config
 
         cm = get_context_manager(user_id)
         mm = get_memory_manager(user_id)
@@ -91,6 +92,12 @@ def make_context_node(context_manager: ContextManager, system_hint: str = None, 
             )
 
             pm = get_prompt_manager()
+            # 模型名用于 MultimodalHintContributor 按能力门控视觉指引。
+            _model_name = ""
+            try:
+                _model_name = (get_config().llm.get("model") or "").strip()
+            except Exception:  # noqa: BLE001
+                _model_name = ""
             pctx = PromptContext(
                 user_id=user_id,
                 thread_id=thread_id,
@@ -99,6 +106,7 @@ def make_context_node(context_manager: ContextManager, system_hint: str = None, 
                 core_files_manager=core_files_manager,
                 memory_manager=mm,
                 mode_hint=system_hint,
+                model_name=_model_name,
             )
             prompt_str = pm.build_sync(pctx)
             if prompt_str:

@@ -42,10 +42,15 @@ def main() -> None:
     mm = None
     try:
         from src.server.graph_provider import get_memory_manager
+        from src.server.config import get_config
+        from src.server.prompt_contributors import is_multimodal_model
 
         mm = get_memory_manager(user_id)
+        model_name = (get_config().llm.get("model") or "").strip()
     except Exception as exc:  # noqa: BLE001
         print(f"[warn] memory_manager 不可用，Memory 贡献器将被跳过: {exc}\n")
+        model_name = ""
+        is_multimodal_model = lambda m: False  # noqa: E731
 
     pm = get_prompt_manager()
     pctx = PromptContext(
@@ -56,7 +61,15 @@ def main() -> None:
         core_files_manager=cfm,
         memory_manager=mm,
         mode_hint="# Agent Mode\n（示例 mode hint，由图在运行时注入）",
+        model_name=model_name,
     )
+
+    print("=" * 78)
+    print(f"当前模型: {model_name or '(空)'}"
+          f"  →  多模态(视觉): {'是' if is_multimodal_model(model_name) else '否'}")
+    print("  （multimodal_hint 仅在模型支持视觉时注入截图/view_image 指引）")
+    print("=" * 78)
+    print()
 
     print("=" * 78)
     print("已注册贡献器（按 priority 升序）:")

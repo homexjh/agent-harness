@@ -11,9 +11,10 @@ context, scroll-context guidance, driver hints, ...) without editing a central
 function, and lets each block opt out per request. This is the B-lite alignment:
 the skeleton + the two highest-value contributors (``EnvContext``, ``ScrollContext``)
 plus the existing workspace-files / memory / mode hints wrapped as contributors.
-The remaining slots (AgentIdentity / Multimodal / CodingMode / DriverPolicy) are
-registered as explicit **placeholder** contributors returning ``None`` so the
-extension points are visible and ready to fill in.
+The multimodal slot is a real, capability-gated contributor (vision guidance only
+when the model can actually see). The remaining slots (AgentIdentity / CodingMode /
+DriverPolicy) are registered as explicit **placeholder** contributors returning
+``None`` so the extension points are visible and ready to fill in.
 """
 from __future__ import annotations
 
@@ -30,6 +31,59 @@ logger = logging.getLogger(__name__)
 
 PROMPT_SEPARATOR = "\n\n"
 
+# Substring keywords (lower-cased model name) that mark a vision-capable model.
+# Expanded as new families appear; ``qwen`` + ``vl`` is handled separately below.
+_MULTIMODAL_KEYWORDS = (
+    "gpt-4o",
+    "gpt-4-vision",
+    "gpt-4-turbo",
+    "gpt-4.1",
+    "gpt-4.5",
+    "gpt-image",
+    "qwen-vl",
+    "qvq",
+    "qwen2-vl",
+    "qwen2.5-vl",
+    "qwen3-vl",
+    "qwen3.5-vl",
+    "gemini",
+    "claude",
+    "pixtral",
+    "llama-3.2-vision",
+    "llama-4",
+    "glm-4v",
+    "glm-4.5v",
+    "cogvlm",
+    "kimi-vl",
+    "internvl",
+    "minicpm-v",
+    "deepseek-vl",
+    "moondream",
+    "phi-3-vision",
+    "phi-4-vision",
+    "mistral-vision",
+    "vision",
+)
+
+
+def is_multimodal_model(model_name: str) -> bool:
+    """Best-effort detection of whether ``model_name`` can understand images.
+
+    There is no explicit capability flag in the harness config, so we infer it
+    from the model name (same heuristic style as ``models._reasoning_kwargs``).
+    Returns ``False`` for empty / unknown names.
+    """
+    if not model_name:
+        return False
+    low = model_name.lower()
+    for kw in _MULTIMODAL_KEYWORDS:
+        if kw in low:
+            return True
+    # Qwen vision variants expose capability via the ``vl`` suffix.
+    if "qwen" in low and "vl" in low:
+        return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -45,6 +99,7 @@ class PromptConfig(BaseModel):
     enable_auto_memory_search: bool = True
     enable_scroll_context: bool = True
     enable_env_context: bool = True
+    enable_multimodal_hint: bool = True
 
 
 _CONFIG: Optional[PromptConfig] = None
@@ -74,6 +129,7 @@ class PromptContext:
     core_files_manager: Any = None
     memory_manager: Any = None
     mode_hint: Optional[str] = None
+    model_name: Optional[str] = None
     config: Optional[PromptConfig] = None
 
     def __post_init__(self) -> None:
@@ -264,13 +320,37 @@ class AgentIdentityContributor(SyncPromptContributor):
 
 
 class MultimodalHintContributor(SyncPromptContributor):
-    """Reserved for multimodal capability hints. No-op until wired up."""
+    """Inject vision/screenshot guidance only when the model can actually see.
+
+    The vision workflow (``desktop_screenshot`` + ``view_image``) used to live
+    unconditionally in ``agentmode._CORE``, so a non-vision model was told to
+    "call view_image" even though it cannot interpret the image. This contributor
+    gates that guidance on real model capability (parity with QwenPaw's
+    ``build_multimodal_hint``), so a text-only model no longer gets misleading
+    instructions and a vision model gets the explicit workflow.
+    """
 
     name = "multimodal_hint"
     priority = 40
 
     def contribute_sync(self, ctx: PromptContext) -> Optional[str]:
-        return None
+        if not ctx.config.enable_multimodal_hint:
+            return None
+        if not is_multimodal_model(ctx.model_name or ""):
+            return None
+        return (
+            "## Multimodal / Vision\n"
+            "You have vision capability and can directly inspect images. For "
+            "questions about the desktop, screen, a screenshot, a webpage, or an "
+            'image ("what is on my screen", "look at this picture/window/page"):\n'
+            "1. Call `desktop_screenshot` to capture the screen (for web/window "
+            "questions you may first use `exec` to open the relevant app);\n"
+            "2. Once the screenshot returns an image path, immediately call "
+            "`view_image` to load and inspect it yourself;\n"
+            "3. Answer based on what you actually see. If you cannot see clearly, "
+            'say so honestly ("I could not see clearly") and re-screenshot if '
+            "needed — never fabricate what is on screen."
+        )
 
 
 class CodingModeContributor(SyncPromptContributor):

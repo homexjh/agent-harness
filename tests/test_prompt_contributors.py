@@ -20,6 +20,7 @@ from server.prompt_contributors import (
     EnvContextContributor,
     AgentIdentityContributor,
     MultimodalHintContributor,
+    is_multimodal_model,
     CodingModeContributor,
     DriverPolicyHintContributor,
     build_default_prompt_manager,
@@ -278,13 +279,86 @@ def test_env_contributor_disabled():
     "cls",
     [
         AgentIdentityContributor,
-        MultimodalHintContributor,
         CodingModeContributor,
         DriverPolicyHintContributor,
     ],
 )
 def test_placeholder_contributors_opt_out(cls):
     assert cls().contribute_sync(_ctx()) is None
+
+
+# ---------------------------------------------------------------------------
+# MultimodalHint (capability-gated, no longer a pure placeholder)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-vision-preview",
+        "gpt-4-turbo",
+        "gpt-4.1",
+        "gpt-4.5",
+        "qwen2.5-vl",
+        "qwen-vl-plus",
+        "qvq-vl",
+        "gemini-1.5-pro",
+        "gemini-2.0-flash",
+        "claude-3-opus",
+        "claude-sonnet-4",
+        "pixtral-12b",
+        "llama-3.2-vision",
+        "llama-4-scout",
+        "glm-4v",
+        "kimi-vl",
+        "internvl2",
+        "deepseek-vl",
+        "moondream",
+    ],
+)
+def test_is_multimodal_model_detects_known(model):
+    assert is_multimodal_model(model) is True
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "",
+        "deepseek-chat",
+        "deepseek-v3",
+        "gpt-4",            # base 4.x without vision suffix
+        "gpt-3.5-turbo",
+        "text-embedding-3-small",
+        "qwen-plus",
+        "qwen-max",
+        "qwq-32b",
+        "llama-3.1-8b",
+    ],
+)
+def test_is_multimodal_model_rejects_unknown(model):
+    assert is_multimodal_model(model) is False
+
+
+def test_multimodal_contributor_injects_when_vision():
+    c = MultimodalHintContributor()
+    out = c.contribute_sync(_ctx(model_name="gpt-4o"))
+    assert out is not None
+    assert "desktop_screenshot" in out
+    assert "view_image" in out
+    assert "Multimodal / Vision" in out
+
+
+def test_multimodal_contributor_skips_when_text_only():
+    c = MultimodalHintContributor()
+    assert c.contribute_sync(_ctx(model_name="deepseek-chat")) is None
+    assert c.contribute_sync(_ctx(model_name="")) is None
+    assert c.contribute_sync(_ctx(model_name=None)) is None
+
+
+def test_multimodal_contributor_disabled():
+    c = MultimodalHintContributor()
+    ctx = _ctx(model_name="gpt-4o", config=PromptConfig(enable_multimodal_hint=False))
+    assert c.contribute_sync(ctx) is None
 
 
 # ---------------------------------------------------------------------------
