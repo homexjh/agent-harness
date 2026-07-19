@@ -405,12 +405,13 @@ class ContextManager:
             window = self._strip_media(window)
         if self._tool_prune_enabled():
             window = self._prune_tool_results(window)
-        if system_hint and window and not isinstance(window[0], SystemMessage):
-            window.insert(0, SystemMessage(content=system_hint))
-        elif system_hint:
-            # 首条已是 system（来自 items），仅当确实无 system 时插入
-            has_system = any(isinstance(m, SystemMessage) for m in window)
-            if not has_system:
+        if system_hint:
+            # 即便 window[0] 是折叠桩（SystemMessage），也要把真正的系统提示插到最前面；
+            # 否则 system_hint 里包含的 workspace 文件 / 当前时间 / mode hint 会一起丢失。
+            if window and isinstance(window[0], SystemMessage):
+                if window[0].content != system_hint:
+                    window.insert(0, SystemMessage(content=system_hint))
+            else:
                 window.insert(0, SystemMessage(content=system_hint))
         if self._metrics is not None:
             sent_tok = sum(

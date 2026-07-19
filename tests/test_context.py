@@ -52,6 +52,21 @@ def test_latest_message_never_folded():
     assert huge.content in [m.content for m in window]
 
 
+def test_system_hint_preserved_when_fold_stub_present():
+    """长会话触发折叠后，system_hint 必须仍然作为第一条 SystemMessage，不能被 fold stub 顶替。"""
+    cm = ContextManager(budget_tokens=1500)
+    raw = _long(*_LONG)
+    system_hint = "Environment Context: Current local time: 2026-07-19 17:19:00 +0800"
+    window, cstate = cm.prepare(raw, "t6", system_hint=system_hint)
+    assert cstate["fold_count"] > 0, "应触发折叠"
+    assert isinstance(window[0], SystemMessage), "首条必须是 SystemMessage"
+    assert system_hint in window[0].content, "系统提示必须保留在第一的位置"
+    assert "[CONTEXT FOLD]" not in window[0].content, "fold stub 不能占据第一条"
+    # 折叠桩应位于系统提示之后
+    stubs = [m for m in window[1:] if isinstance(m, SystemMessage) and "[CONTEXT FOLD]" in (m.content or "")]
+    assert len(stubs) == 1, "应保留且仅保留一个折叠桩，并排在系统提示之后"
+
+
 def test_recall_does_not_duplicate_on_reprepare():
     cm = ContextManager(budget_tokens=1500, allow_unsandboxed_recall=True)
     raw = _long(*_LONG)
