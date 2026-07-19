@@ -273,7 +273,11 @@ class ScrollContextContributor(SyncPromptContributor):
             "- recall(\"keyword\"): search folded history by keyword (or by "
             "semantic similarity when available).\n"
             "When relevant history may have been folded, prefer recalling it "
-            "before answering from assumptions."
+            "before answering from assumptions.\n"
+            "Large tool results (over the inline limit) are auto-externalized to "
+            "local disk and replaced with a short placeholder in context. The "
+            "original is fully preserved — call recall(\"<token>\") (the Token "
+            "printed in the placeholder) to read the complete output."
         )
 
 

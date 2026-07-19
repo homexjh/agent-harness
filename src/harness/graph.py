@@ -29,6 +29,7 @@ from .gates.doom_loop import DoomLoopGate
 from .gates.iteration import IterationGate
 from .state import AgentState
 from .tools_node import make_tools_node
+from .tool_result_store import get_tool_result_store
 
 # 把 auto_memory 放到独立后台线程执行：它会调用 LLM 提取事实并重建索引，
 # 同步执行会阻塞 context_node 数十秒（响应冻结）。# QwenPaw 的 auto_memory 是响应路径外的后台维护任务，这里用单线程 executor 对齐。
@@ -312,7 +313,7 @@ def build_graph(
 
     governor = make_governor(gates, metrics=metrics)
     agent_model = make_call_model(model, tools=list(tools.values()), metrics=metrics, breaker=breaker)
-    tools_node = make_tools_node(tools, metrics=metrics)
+    tools_node = make_tools_node(tools, metrics=metrics, tool_result_store=get_tool_result_store())
     context_node = make_context_node(context_manager, system_hint=system_hint, memory_manager=memory_manager, core_files_manager=core_files_manager)
     approval_node = make_approval_node(approval_gate)
     hitl_node = make_hitl_node()

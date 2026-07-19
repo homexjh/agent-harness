@@ -979,6 +979,9 @@ def get_context_manager(user_id: str | None = None) -> ContextManager:
             embedding_client = get_memory_manager(uid).vault.embedding
         except Exception:
             embedding_client = None
+        # 执行层外置存储（工具结果超阈值落盘，recall 可还原）
+        from ..harness.tool_result_store import get_tool_result_store
+
         _cm[uid] = ContextManager(
             budget_tokens=int(os.getenv("CONTEXT_BUDGET", str(cfg.budget_tokens))),
             allow_unsandboxed_recall=(
@@ -986,6 +989,10 @@ def get_context_manager(user_id: str | None = None) -> ContextManager:
             ),
             strip_media=cfg.strip_media,
             max_tool_result_chars=cfg.max_tool_result_chars,
+            recent_tool_result_chars=cfg.recent_tool_result_chars,
+            old_tool_result_chars=cfg.old_tool_result_chars,
+            recent_tool_window=cfg.recent_tool_window,
+            tool_result_store=get_tool_result_store(),
             reserve_ratio=cfg.reserve_ratio,
             hard_stop_tokens=cfg.hard_stop_tokens,
             embedding_client=embedding_client,

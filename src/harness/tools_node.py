@@ -13,11 +13,19 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
 
 from .stability.observability import log_event
+from .tool_result_store import (
+    get_tool_result_store,
+    make_placeholder,
+)
 
 
 def prune_tool_result(content: str, max_chars: int, *, metrics=None, tool: str = "") -> str:
     """ToolResultPruning（QwenPaw: ToolResultPruningMiddleware）：截断超大工具输出，
     防止上下文爆炸。保留头尾各一半 + 中间省略提示（含原始长度），信息可感知不误导。
+
+    注意：此 head/tail 截断**会丢失中间内容**，仅作为显式 ``max_result_chars>0`` 时的
+    可选 inline 兜底；主路径已由执行层外置（``externalize``）替代——超阈值结果全文落盘、
+    上下文留占位符、``recall`` 可还原，绝不丢原文。
     """
     if max_chars <= 0 or len(content) <= max_chars:
         return content
@@ -33,11 +41,46 @@ def prune_tool_result(content: str, max_chars: int, *, metrics=None, tool: str =
     return pruned
 
 
-def make_tools_node(tools: dict, *, metrics=None, max_result_chars: int = None):
-    if max_result_chars is None:
-        max_result_chars = int(os.getenv("TOOL_RESULT_MAX", "8000"))
+def _externalize_or_inline(
+    content: str,
+    store,
+    thread_id: str,
+    tool_name: str,
+    threshold_chars: int,
+) -> str:
+    """执行层外置（对齐 QwenPaw ToolResultLimiter / WorkBuddy ToolResultBlobService）：
 
-    def tools_node(state: dict) -> dict:
+    - 超阈值：全文写盘，上下文返回占位符（含 token，recall 可还原全文）；
+    - 否则：保持**完整 inline**，不做任何截断（与"粗暴截断"的本质区别）。
+    """
+    if store is None or threshold_chars <= 0:
+        return content
+    if len(content) <= threshold_chars:
+        return content
+    token = store.externalize(content, thread_id=thread_id, tool_name=tool_name)
+    return make_placeholder(tool_name, token, len(content))
+
+
+def make_tools_node(
+    tools: dict,
+    *,
+    metrics=None,
+    max_result_chars: int = None,
+    tool_result_store=None,
+    externalize_threshold: int = None,
+):
+    store = tool_result_store or get_tool_result_store()
+    # 默认关闭显式 inline 截断（max_result_chars=0）；执行层外置才是主机制。
+    if max_result_chars is None:
+        max_result_chars = int(os.getenv("TOOL_RESULT_MAX", "0"))
+    if externalize_threshold is None:
+        kb = int(os.getenv("AGENT_TOOL_RESULT_THRESHOLD_KB", "50"))
+        externalize_threshold = kb * 1024
+
+    def tools_node(state: dict, config=None) -> dict:
+        thread_id = "default"
+        if config:
+            thread_id = (config.get("configurable", {}) or {}).get("thread_id", "default") or "default"
         last = state["messages"][-1]
         outputs = []
         for tc in getattr(last, "tool_calls", []):
@@ -60,9 +103,16 @@ def make_tools_node(tools: dict, *, metrics=None, max_result_chars: int = None):
                 except Exception as e:  # noqa: BLE001 - 工具错误回传模型
                     log_event("tool_error", tool=name, error=str(e))
                     content = f"Error: {e}"
-            content = prune_tool_result(
-                str(content), max_result_chars, metrics=metrics, tool=name
+            content = str(content)
+            # 第 1 层（执行层外置）：超阈值落盘，否则保持完整 inline。
+            content = _externalize_or_inline(
+                content, store, thread_id, name, externalize_threshold
             )
+            # 可选 inline 兜底截断（仅当显式设置 max_result_chars>0）；store 仍留全文可 recall。
+            if max_result_chars > 0 and len(content) > max_result_chars:
+                content = prune_tool_result(
+                    content, max_result_chars, metrics=metrics, tool=name
+                )
             outputs.append(ToolMessage(content=content, tool_call_id=tc["id"]))
         return {"messages": outputs}
 

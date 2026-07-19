@@ -52,6 +52,11 @@ from langchain_core.messages import (
 )
 
 from .store import TurnStore
+from ..tool_result_store import (
+    EXTERNALIZE_MARKER,
+    extract_token,
+    is_externalized_placeholder,
+)
 
 FOLD_STUB_MARKER = "[CONTEXT FOLD]"
 
@@ -93,6 +98,10 @@ class ContextManager:
         allow_unsandboxed_recall: Optional[bool] = None,
         strip_media: bool = True,
         max_tool_result_chars: int = 0,
+        recent_tool_result_chars: int = 8000,
+        old_tool_result_chars: int = 2000,
+        recent_tool_window: int = 4,
+        tool_result_store=None,
         reserve_ratio: float = 0.2,
         hard_stop_tokens: int = 300000,
         embedding_client=None,
@@ -108,8 +117,14 @@ class ContextManager:
         )
         # QwenPaw 媒体降级等效：历史 base64 媒体从上下文剥离省 token。
         self.strip_media = strip_media
-        # QwenPaw ToolResultPruningMiddleware 等效：工具结果超长则在窗口里截断（store 仍留全文）。
+        # QwenPaw ToolResultPruningMiddleware 等效：上下文层分层裁剪。
+        # 旧字段 max_tool_result_chars>0 走扁平兜底；否则按 recent/old 分层（均<=0 关闭）。
         self._max_tool_result_chars = max(0, int(max_tool_result_chars))
+        self._recent_tool_result_chars = max(0, int(recent_tool_result_chars))
+        self._old_tool_result_chars = max(0, int(old_tool_result_chars))
+        self._recent_tool_window = max(0, int(recent_tool_window))
+        # 执行层外置存储（工具结果超阈值落盘），供 recall 还原全文。
+        self._tr_store = tool_result_store
         # 对齐 QwenPaw 保留区 + BudgetGate 硬停
         self.reserve_ratio = max(0.0, min(1.0, float(reserve_ratio)))
         self.hard_stop_tokens = max(0, int(hard_stop_tokens))
@@ -312,35 +327,73 @@ class ContextManager:
             self._metrics.media_strip(stripped)
         return window
 
-    # ---- 工具结果裁剪：把窗口里超长的 ToolMessage 截断（QwenPaw ToolResultPruningMiddleware 等效） ----
-    # 仅在发送给模型的窗口上截断；store 中的原文保持完整，recall 可还原。
+    # ---- 工具结果分层裁剪（QwenPaw ToolResultPruningMiddleware 等效） ----
+    # 仅在发送给模型的**窗口**上裁剪；store 中的原文保持完整，recall 可还原。
+    # 分层：最近 recent_tool_window 个工具结果保留 recent 上限，更早的只留 old 上限。
+    # 外置占位符（[TOOL RESULT EXTERNALIZED]）本身很短，无需裁剪，直接跳过。
+    def _tool_prune_enabled(self) -> bool:
+        return self._max_tool_result_chars > 0 or (
+            self._recent_tool_result_chars > 0 or self._old_tool_result_chars > 0
+        )
+
     def _prune_tool_results(self, window: list) -> list:
-        limit = self._max_tool_result_chars
+        if not self._tool_prune_enabled():
+            return window
+        # 扁平兜底（历史字段）：单一上限，覆盖分层。
+        if self._max_tool_result_chars > 0:
+            return self._prune_flat(window, self._max_tool_result_chars)
+        # 分层（recent/old）
+        tool_idx = [i for i, m in enumerate(window) if isinstance(m, ToolMessage)]
+        recent_set = set(tool_idx[-self._recent_tool_window:]) if self._recent_tool_window > 0 else set(tool_idx)
+        pruned = 0
+        for i, m in enumerate(window):
+            if not isinstance(m, ToolMessage):
+                continue
+            if is_externalized_placeholder(getattr(m, "content", "")):
+                continue  # 占位符已是极短引用，跳过
+            cap = self._recent_tool_result_chars if i in recent_set else self._old_tool_result_chars
+            if cap <= 0:
+                continue
+            pruned += self._truncate_tool_message(m, cap)
+        if pruned and self._metrics is not None and hasattr(self._metrics, "tool_result_prune"):
+            self._metrics.tool_result_prune(pruned)
+        return window
+
+    def _prune_flat(self, window: list, limit: int) -> list:
         pruned = 0
         for m in window:
             if not isinstance(m, ToolMessage):
                 continue
-            content = getattr(m, "content", None)
-            if isinstance(content, str):
-                if len(content) > limit:
-                    m.content = (
-                        content[:limit]
-                        + f"\n... [tool result truncated to {limit} chars; call recall to restore full]"
-                    )
-                    pruned += len(content) - limit
-            elif isinstance(content, list):
-                new_parts = []
-                for p in content:
-                    if isinstance(p, dict) and p.get("type") == "text":
-                        t = p.get("text", "")
-                        if len(t) > limit:
-                            pruned += len(t) - limit
-                            p = {**p, "text": t[:limit] + f"\n... [truncated to {limit} chars]"}
-                    new_parts.append(p)
-                m.content = new_parts
+            if is_externalized_placeholder(getattr(m, "content", "")):
+                continue
+            pruned += self._truncate_tool_message(m, limit)
         if pruned and self._metrics is not None and hasattr(self._metrics, "tool_result_prune"):
             self._metrics.tool_result_prune(pruned)
         return window
+
+    @staticmethod
+    def _truncate_tool_message(m: ToolMessage, limit: int) -> int:
+        """在窗口上把工具结果截断到 limit（store 仍留全文 → recall 可还原）。返回裁掉字符数。"""
+        content = getattr(m, "content", None)
+        removed = 0
+        if isinstance(content, str):
+            if len(content) > limit:
+                m.content = (
+                    content[:limit]
+                    + f"\n... [tool result truncated to {limit} chars; call recall(seq) to restore full]"
+                )
+                removed = len(content) - limit
+        elif isinstance(content, list):
+            new_parts = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    t = p.get("text", "")
+                    if len(t) > limit:
+                        removed += len(t) - limit
+                        p = {**p, "text": t[:limit] + f"\n... [truncated to {limit} chars; recall to restore]"}
+                new_parts.append(p)
+            m.content = new_parts
+        return removed
 
     # ---- 对外：准备本轮发送给模型的窗口 ----
     def prepare(self, raw_messages: list, thread_id, system_hint: Optional[str] = None):
@@ -350,7 +403,7 @@ class ContextManager:
         window, folded_seqs = self._fold(items)
         if self.strip_media:
             window = self._strip_media(window)
-        if self._max_tool_result_chars > 0:
+        if self._tool_prune_enabled():
             window = self._prune_tool_results(window)
         if system_hint and window and not isinstance(window[0], SystemMessage):
             window.insert(0, SystemMessage(content=system_hint))
@@ -403,8 +456,12 @@ class ContextManager:
     def clear(self, thread_id) -> int:
         return self._store.clear(thread_id)
 
-    # ---- 召回：agent 显式调用，还原折叠区全文 ----
-    # seq= 精确还原某 seq 全文；query= 走语义 top-k（embedding）或 keyword 子串回退 ----
+    # ---- 召回：agent 显式调用，还原折叠区 / 外置工具结果全文 ----
+    # 支持三种入口：
+    #  - seq=          精确还原某 seq（含被外置落盘的工具结果，从磁盘取回全文）
+    #  - query="seq=N"  同上（recall 工具只传单字符串，故解析 seq= 形式）
+    #  - query=token   外置占位符里的 Token，直接还原落盘全文
+    #  - query=keyword  语义 top-k（embedding）或 keyword 子串；无命中时回退搜外置 blob
     def recall(self, query: str = None, thread_id=None, seq=None, top_k: int = 3) -> str:
         tid = thread_id or self._active_thread
         if tid is None:
@@ -416,18 +473,48 @@ class ContextManager:
             )
         rows = self._store.all(tid)
 
-        # 1) 精确 seq 还原（对齐 QwenPaw recall_history 的精确 seq 召回）
-        if seq is not None:
-            target = int(seq) if isinstance(seq, str) and str(seq).isdigit() else seq
+        # 0) query 里可能带 "seq=N" 或本身就是 token，先归一。
+        resolved_seq = seq
+        q_raw = (query or "").strip()
+        if resolved_seq is None and q_raw.lower().startswith("seq="):
+            try:
+                resolved_seq = int(q_raw[4:].strip())
+            except ValueError:
+                resolved_seq = None
+        # token 直取（外置占位符 Token 形如 <thread>/<file>.txt）
+        if (
+            resolved_seq is None
+            and self._tr_store is not None
+            and q_raw
+            and q_raw.lower().endswith(".txt")
+            and ("/" in q_raw or "\\" in q_raw)
+        ):
+            full = self._tr_store.recall(q_raw)
+            if full is not None:
+                if self._metrics is not None:
+                    self._metrics.recall(1)
+                return f"recall(token={q_raw}) restored:\n\n{full[:4000]}"
+
+        # 1) 精确 seq 还原（对齐 QwenPaw recall_history 的精确 seq 召回；外置结果从磁盘取回）
+        if resolved_seq is not None:
+            target = int(resolved_seq) if isinstance(resolved_seq, str) and str(resolved_seq).isdigit() else resolved_seq
             for it in rows:
                 if it["seq"] == target:
                     content = _content_of(it["msg"])
+                    # 若该 turn 是被外置落盘的工具结果，从磁盘取回全文。
+                    if is_externalized_placeholder(content) and self._tr_store is not None:
+                        tok = extract_token(content)
+                        full = self._tr_store.recall(tok) if tok else None
+                        if full is not None:
+                            if self._metrics is not None:
+                                self._metrics.recall(1)
+                            return f"recall(seq={resolved_seq}) restored (from disk):\n\n{full[:4000]}"
                     if self._metrics is not None:
                         self._metrics.recall(1)
-                    return f"recall(seq={seq}) restored:\n\n{content[:4000]}"
-            return f"recall: seq={seq} not found in store."
+                    return f"recall(seq={resolved_seq}) restored:\n\n{content[:4000]}"
+            return f"recall: seq={resolved_seq} not found in store."
 
-        q = (query or "").strip().lower()
+        q = q_raw.lower()
         if not q:
             return "recall: provide a seq or a query."
 
@@ -466,11 +553,23 @@ class ContextManager:
             content = _content_of(it["msg"])
             if q and q in (content or "").lower():
                 matched.append((it["seq"], content))
-        if not matched:
-            return f"recall: no content matches '{query}'."
-        out = [f"recall('{query}') restored {len(matched)} turn(s):"]
-        for seq, content in matched:
-            out.append(f"\n--- turn {seq} ---\n{content[:2000]}")
-        if self._metrics is not None:
-            self._metrics.recall(len(matched))
-        return "\n".join(out)
+        if matched:
+            out = [f"recall('{query}') restored {len(matched)} turn(s):"]
+            for s, content in matched:
+                out.append(f"\n--- turn {s} ---\n{content[:2000]}")
+            if self._metrics is not None:
+                self._metrics.recall(len(matched))
+            return "\n".join(out)
+
+        # 4) 外置 blob 关键词回退：store 里没有命中时，搜落盘的工具结果全文。
+        if self._tr_store is not None:
+            hits = self._tr_store.search_thread(str(tid), q, limit=top_k)
+            if hits:
+                out = [f"recall('{query}') restored {len(hits)} externalized tool result(s):"]
+                for fname, snippet in hits:
+                    out.append(f"\n--- {fname} ---\n{snippet}")
+                if self._metrics is not None:
+                    self._metrics.recall(len(hits))
+                return "\n".join(out)
+
+        return f"recall: no content matches '{query}'."

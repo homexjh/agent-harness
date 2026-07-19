@@ -8,5 +8,13 @@
 from .store import TurnStore
 from .manager import ContextManager, FOLD_STUB_MARKER
 from .recall_tool import make_recall_tool
+from ..tool_result_store import ToolResultStore, get_tool_result_store
 
-__all__ = ["TurnStore", "ContextManager", "make_recall_tool", "FOLD_STUB_MARKER"]
+__all__ = [
+    "TurnStore",
+    "ContextManager",
+    "make_recall_tool",
+    "FOLD_STUB_MARKER",
+    "ToolResultStore",
+    "get_tool_result_store",
+]

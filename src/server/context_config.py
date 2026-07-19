@@ -8,8 +8,14 @@
 - ``enable_recall``：是否允许 agent 在**同一 thread 内**显式 recall 还原被折叠的历史
   （QwenPaw 的 recall_history / 召回沙箱门控）。
 - ``strip_media``：把历史里的 base64 图片/音视频从上下文剥离省 token（QwenPaw 媒体降级）。
-- ``max_tool_result_chars``：工具结果裁剪上限（QwenPaw 的 ToolResultPruningMiddleware 等效）；
-  0 = 不裁剪。超出部分在上下文里截断，但原始全文仍保留在 store，recall 可还原。
+- ``tool_result_externalize_kb``：执行层外置阈值（KB）。工具结果超过该值（默认 50KB）
+  即**全文落盘**、上下文留占位符（对齐 WorkBuddy ``CODEBUDDY_TOOL_RESULT_THRESHOLD_KB`` /
+  QwenPaw ``ToolResultLimiter``）。阈值以下保持完整 inline，绝不头尾截断。
+- ``recent_tool_result_chars`` / ``old_tool_result_chars`` / ``recent_tool_window``：上下文层
+  **分层裁剪**（对齐 QwenPaw ``ToolResultPruningMiddleware`` recent/old 分层）。最近
+  ``recent_tool_window`` 个工具结果保留 ``recent_tool_result_chars``，更早的只留
+  ``old_tool_result_chars``；二者都 <=0 时关闭分层。窗口截断但 store 留全文，recall 可还原。
+- ``max_tool_result_chars``：历史字段（扁平兜底）。>0 时以单一上限截断（覆盖分层），0 = 走分层。
 
 配置持久化到 ``DATA_HOME/context_config.json``（即 ~/.agent-harness），与 memory_config.json 同目录。
 """
@@ -57,7 +63,13 @@ class ContextManagerConfig(BaseModel):
     enable_recall: bool = True
     # 历史里的 base64 媒体从上下文剥离（省 token）。
     strip_media: bool = True
-    # 工具结果裁剪上限（字符）。0 = 不裁剪。
+    # 执行层外置阈值（KB）：工具结果超此值即全文落盘、上下文留占位符。
+    tool_result_externalize_kb: int = 50
+    # 上下文层分层裁剪：最近窗口的工具结果保留 recent，更早的只留 old；二者均 <=0 关闭分层。
+    recent_tool_result_chars: int = 8000
+    old_tool_result_chars: int = 2000
+    recent_tool_window: int = 4
+    # 历史字段（扁平兜底）：>0 时以单一上限截断覆盖分层；0 = 走分层。
     max_tool_result_chars: int = 0
     # 语义召回：recall(query) 在有 embedding 时走向量余弦 top-k，否则回退 keyword。
     enable_semantic_recall: bool = True
