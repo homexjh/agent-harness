@@ -1201,6 +1201,7 @@ def get_request_graph(llm_overrides: dict) -> tuple[Any, bool]:
         system_hint=mode_spec.system_prompt,
         memory_manager=get_memory_manager(),
         core_files_manager=get_core_files_manager(),
+        mode=mode,
     )
     with _request_graph_lock:
         _request_graph_cache[sig] = (g, reasoning)

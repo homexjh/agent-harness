@@ -63,7 +63,7 @@ def _last_human_text(messages: list) -> str:
     return ""
 
 
-def make_context_node(context_manager: ContextManager, system_hint: str = None, memory_manager=None, core_files_manager=None):
+def make_context_node(context_manager: ContextManager, system_hint: str = None, memory_manager=None, core_files_manager=None, mode: str = "chat"):
     def context_node(state: dict, config: RunnableConfig) -> dict:
         _t = time.perf_counter()
         conf = (config or {}).get("configurable", {})
@@ -108,6 +108,7 @@ def make_context_node(context_manager: ContextManager, system_hint: str = None, 
                 memory_manager=mm,
                 mode_hint=system_hint,
                 model_name=_model_name,
+                mode=mode,
             )
             prompt_str = pm.build_sync(pctx)
             if prompt_str:
@@ -306,15 +307,15 @@ def build_graph(
     breaker=None,
     memory_manager=None,
     core_files_manager=None,
+    mode: str = "chat",
 ):
     gates = gates or [IterationGate(max_iterations=max_iterations), DoomLoopGate()]
     context_manager = context_manager or ContextManager()
     approval_gate = approval_gate or ApprovalGate()
-
     governor = make_governor(gates, metrics=metrics)
     agent_model = make_call_model(model, tools=list(tools.values()), metrics=metrics, breaker=breaker)
     tools_node = make_tools_node(tools, metrics=metrics, tool_result_store=get_tool_result_store())
-    context_node = make_context_node(context_manager, system_hint=system_hint, memory_manager=memory_manager, core_files_manager=core_files_manager)
+    context_node = make_context_node(context_manager, system_hint=system_hint, memory_manager=memory_manager, core_files_manager=core_files_manager, mode=mode)
     approval_node = make_approval_node(approval_gate)
     hitl_node = make_hitl_node()
     agent_node = make_agent_node(agent_model)

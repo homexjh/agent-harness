@@ -288,6 +288,34 @@ def test_placeholder_contributors_opt_out(cls):
 
 
 # ---------------------------------------------------------------------------
+# CodingMode (mode-gated, no longer a pure placeholder)
+# ---------------------------------------------------------------------------
+def test_coding_mode_contributor_active_in_coding():
+    c = CodingModeContributor()
+    out = c.contribute_sync(_ctx(mode="coding"))
+    assert out is not None
+    assert "Coding Workflow" in out
+    assert "write_file" in out
+
+
+def test_coding_mode_contributor_active_in_mission():
+    c = CodingModeContributor()
+    assert c.contribute_sync(_ctx(mode="mission")) is not None
+
+
+def test_coding_mode_contributor_opt_out_in_chat():
+    c = CodingModeContributor()
+    assert c.contribute_sync(_ctx(mode="chat")) is None
+    assert c.contribute_sync(_ctx(mode=None)) is None
+
+
+def test_coding_mode_contributor_disabled():
+    c = CodingModeContributor()
+    ctx = _ctx(mode="coding", config=PromptConfig(enable_coding_mode=False))
+    assert c.contribute_sync(ctx) is None
+
+
+# ---------------------------------------------------------------------------
 # MultimodalHint (capability-gated, no longer a pure placeholder)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(

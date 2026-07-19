@@ -80,3 +80,85 @@ def test_make_guarded_tools_keeps_original_names():
     guarded = make_guarded_tools([tool], ToolGuardEngine())
     assert "calculator" in guarded
     assert guarded["calculator"].name == "calculator"
+
+
+def test_shellevasion_exempts_write_file_content():
+    """写文件的内容是代码/HTML，含 ; && || 不应被判为 shell 注入。
+
+    这是「写俄罗斯方块 HTML 被误杀」的根因回归：ShellEvasion 必须跳过
+    write_file/edit_file 的 content/old/new 等数据字段。
+    """
+    g = ShellEvasionGuardian()
+    js = "function f(){ if(x && y){ doThing(); } return a; }"
+    assert g.check("write_file", {"path": "game.js", "content": js}).allowed
+    assert g.check(
+        "edit_file", {"path": "g.js", "old": "a; b", "new": "c && d"}
+    ).allowed
+
+
+def test_shellevasion_still_scans_path_field():
+    """路径/控制字段仍要扫描（数据字段豁免不等于完全不扫）。"""
+    g = ShellEvasionGuardian()
+    assert not g.check("write_file", {"path": "/x; rm -rf /"}).allowed
+
+
+def test_shellevasion_exec_still_scans_command():
+    """exec 类命令串仍扫描 shell 元字符（即便图里通常走独立引擎）。"""
+    g = ShellEvasionGuardian()
+    assert not g.check("exec", {"command": "echo hi; rm -rf /"}).allowed
+    assert g.check("exec", {"command": "ls -la"}).allowed
+
+
+def _ai_with_tool_calls(calls):
+    from langchain_core.messages import AIMessage
+
+    return AIMessage(content="", tool_calls=calls)
+
+
+def test_approvalgate_autopproves_workspace_file_writes():
+    """非信任模式下，workspace 内 write_file/edit_file 自动放行（不再卡死编码）。"""
+    from src.harness.security.approval import ApprovalGate
+
+    gate = ApprovalGate(trust_mode=False)  # 默认 AUTO：trust_mode=False
+    state = {
+        "messages": [
+            _ai_with_tool_calls(
+                [{"name": "write_file", "args": {"path": "a.html", "content": "<x/>"}, "id": "1"}]
+            )
+        ]
+    }
+    assert gate.check(state) is None  # 无需审批
+
+    state2 = {
+        "messages": [
+            _ai_with_tool_calls(
+                [{"name": "edit_file", "args": {"path": "a.js", "old": "x", "new": "y"}, "id": "2"}]
+            )
+        ]
+    }
+    assert gate.check(state2) is None
+
+
+def test_approvalgate_still_requires_dangerous_or_delete():
+    """破坏性 exec 与 delete_file 仍走审批（底线保留）。"""
+    from src.harness.security.approval import ApprovalGate
+
+    gate = ApprovalGate(trust_mode=False)
+    # 危险 exec
+    state = {
+        "messages": [
+            _ai_with_tool_calls(
+                [{"name": "exec", "args": {"command": "rm -rf /"}, "id": "1"}]
+            )
+        ]
+    }
+    assert gate.check(state) is not None
+    # delete_file（非信任模式）
+    state2 = {
+        "messages": [
+            _ai_with_tool_calls(
+                [{"name": "delete_file", "args": {"path": "a.txt"}, "id": "2"}]
+            )
+        ]
+    }
+    assert gate.check(state2) is not None

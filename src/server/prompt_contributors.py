@@ -100,6 +100,7 @@ class PromptConfig(BaseModel):
     enable_scroll_context: bool = True
     enable_env_context: bool = True
     enable_multimodal_hint: bool = True
+    enable_coding_mode: bool = True
 
 
 _CONFIG: Optional[PromptConfig] = None
@@ -130,6 +131,7 @@ class PromptContext:
     memory_manager: Any = None
     mode_hint: Optional[str] = None
     model_name: Optional[str] = None
+    mode: Optional[str] = None
     config: Optional[PromptConfig] = None
 
     def __post_init__(self) -> None:
@@ -358,13 +360,43 @@ class MultimodalHintContributor(SyncPromptContributor):
 
 
 class CodingModeContributor(SyncPromptContributor):
-    """Reserved for coding-mode hints. No-op until wired up."""
+    """Inject a coding workflow only when the session is in coding/mission mode.
+
+    Mirrors QwenPaw's CodingMode contributor: in a coding task the model should
+    plan, write complete files in one shot, prefer ``write_file`` for new files
+    and ``edit_file`` only for surgical changes, then actually verify the result
+    instead of claiming success. This directly addresses the "very slow / didn't
+    finish" coding-task regression where the model kept re-reading the same file
+    and churned through tiny edits.
+    """
 
     name = "coding_mode"
     priority = 45
 
+    _CODING_MODES = {"coding", "mission"}
+
     def contribute_sync(self, ctx: PromptContext) -> Optional[str]:
-        return None
+        if not ctx.config.enable_coding_mode:
+            return None
+        mode = (ctx.mode or "").strip().lower()
+        if mode not in self._CODING_MODES:
+            return None
+        return (
+            "## Coding Workflow\n"
+            "You are in a coding task. Follow this workflow to finish efficiently "
+            "and avoid wasted turns:\n"
+            "1. Plan first: break the task into concrete files/functions before writing.\n"
+            "2. Write complete files in one shot: use `write_file` with the FULL file "
+            "content rather than many small `edit_file` calls. Re-read a file only when "
+            "you must confirm an exact substring for a surgical edit.\n"
+            "3. Use `write_file` for new files; use `edit_file` (old -> new string "
+            "replacement) only for targeted changes.\n"
+            "4. After writing, verify by actually running it (start a local server, open "
+            "in a browser, or run a script). Do not claim completion without a real check.\n"
+            "5. Keep the full source you just wrote in context; do NOT re-read the same "
+            "file repeatedly — that wastes turns. Large tool results may be externalized; "
+            "call recall(\"<token>\") only if you truly need that content back."
+        )
 
 
 class DriverPolicyHintContributor(SyncPromptContributor):

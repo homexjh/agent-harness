@@ -95,8 +95,25 @@ class ShellEvasionGuardian(BaseGuardian):
 
     _INJECTION = re.compile(r"(;|\|\||\&\&|\$\(|\`|>\s*/|\|\s*)")
 
+    # 文件写入/编辑类工具的"数据载荷"字段：内容是代码/文本/HTML，绝不是 shell
+    # 命令。若对其扫描 shell 元字符，任何 JS/HTML 文件都会因分号/管道被误杀。
+    # 这些工具由 FilePathGuardian 限制在 workspace 根内，安全由沙箱保证，故
+    # ShellEvasion 完全跳过其数据字段（对齐 QwenPaw/WorkBuddy「只扫命令串」）。
+    _DATA_FIELDS = {
+        "content", "old", "old_string", "new", "new_string",
+        "text", "code", "code_text", "source", "data", "body", "script", "html",
+    }
+    # shell 类工具：只扫命令串（且这些工具在图里本就走不带 ShellEvasion 的 exec 引擎）。
+    _EXEC_TOOLS = {"exec", "run_command", "shell", "bash", "terminal"}
+    _EXEC_FIELDS = {"command", "cmd"}
+
     def check(self, tool_name: str, args: dict) -> GuardResult:
-        for v in (args or {}).values():
+        if tool_name in self._EXEC_TOOLS:
+            fields = [v for k, v in (args or {}).items() if k in self._EXEC_FIELDS]
+        else:
+            # 非 shell 工具：跳过数据载荷字段，仅扫描路径/参数等控制字段
+            fields = [v for k, v in (args or {}).items() if k not in self._DATA_FIELDS]
+        for v in fields:
             if not isinstance(v, str):
                 continue
             hits = self._INJECTION.findall(v)

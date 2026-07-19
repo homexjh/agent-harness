@@ -34,6 +34,14 @@ SENSITIVE_TOOLS = {
     "publish",
 }
 
+# 文件写入/编辑类工具：已被 FilePathGuardian 限制在 workspace 根内（沙箱），
+# 在项目目录内写/改文件是编码任务的常规操作，无需每步人工审批。对齐 QwenPaw /
+# WorkBuddy 对「作用域内写操作」的信任，自动放行。删除类操作（delete_file）仍
+# 走常规裁决路径，保留一道底线。
+_FILE_WRITE_TOOLS = {
+    "write_file", "edit_file", "create_file", "append_file", "write", "edit",
+}
+
 # 破坏性命令：即便信任模式也强制要求人工裁决（底线）
 DANGEROUS_EXEC = re.compile(
     r"\b("
@@ -190,7 +198,10 @@ class ApprovalGate:
                 still_need_approval.append(name)
                 continue
 
-            # 非 exec 的敏感工具（write_file/edit_file/…）
+            # 非 exec 的敏感工具
+            if name in _FILE_WRITE_TOOLS:
+                # 作用域内写/改文件：沙箱已限制路径，自动放行（不再卡死编码任务）
+                continue
             if self.trust_mode:
                 continue  # 信任模式下全部放行
             still_need_approval.append(name)
