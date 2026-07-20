@@ -39,6 +39,7 @@ from .scheduler import (
     validate_schedule,
 )
 from .sse_utils import jsonable
+from . import inbox_store
 
 router = APIRouter(prefix="")
 
@@ -856,6 +857,7 @@ class CronJob(BaseModel):
     timezone: str = "Asia/Shanghai"
     schedule_type: str | None = None  # hourly | daily | weekly | custom | scheduled(once)
     run_at: str | None = None       # 一次性任务（对齐 qwenpaw 的 once）：ISO8601 时间
+    save_result_to_inbox: bool = True  # 对齐 QwenPaw save_result_to_inbox 默认 True：结果进收件箱/会话窗口
 
 
 @router.post("/cron")
@@ -879,6 +881,7 @@ def cron_add(job: CronJob):
         "timezone": job.timezone,
         "schedule_type": schedule_type,
         "run_at": job.run_at,
+        "save_result_to_inbox": job.save_result_to_inbox,
         "created": int(time.time()),
     })
     CRON_DB_PATH.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -930,6 +933,52 @@ def cron_state(jid: str):
 @router.get("/cron/validate")
 def cron_validate(schedule: str):
     return validate_schedule(schedule)
+
+
+# ---------------------------------------------------------------------------
+# Inbox 收件箱（cron/后台任务结果投递，前端轮询渲染进会话窗口；对齐 QwenPaw /inbox/events）
+# ---------------------------------------------------------------------------
+@router.get("/inbox/events")
+def inbox_events(
+    limit: int = 50,
+    offset: int = 0,
+    source_type: str = "",
+    status: str = "",
+    unread_only: bool = False,
+):
+    return {
+        "events": inbox_store.list_events(
+            limit=limit,
+            offset=offset,
+            source_type=source_type or None,
+            status=status or None,
+            unread_only=unread_only,
+        ),
+        "unread": inbox_store.unread_count(source_type or None),
+    }
+
+
+@router.get("/inbox/unread")
+def inbox_unread(source_type: str = ""):
+    return {"count": inbox_store.unread_count(source_type or None)}
+
+
+@router.post("/inbox/read")
+def inbox_read(payload: dict = {}):
+    ids = payload.get("ids") or []
+    if ids:
+        return {"updated": inbox_store.mark_read(ids)}
+    return {"updated": 0}
+
+
+@router.post("/inbox/read/all")
+def inbox_read_all():
+    return {"updated": inbox_store.mark_all_read()}
+
+
+@router.delete("/inbox/events/{event_id}")
+def inbox_delete(event_id: str):
+    return {"ok": inbox_store.delete_event(event_id)}
 
 
 # ---------------------------------------------------------------------------

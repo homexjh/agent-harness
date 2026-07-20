@@ -766,6 +766,7 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True)
                 "timezone": "Asia/Shanghai",
                 "schedule_type": "scheduled",
                 "run_at": run_at,
+                "save_result_to_inbox": True,
                 "created": int(datetime.now(timezone.utc).timestamp()),
             }
         else:
@@ -780,6 +781,7 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True)
                 "timezone": "Asia/Shanghai",
                 "schedule_type": "scheduled",
                 "run_at": run_at,
+                "save_result_to_inbox": True,
                 "created": int(datetime.now(timezone.utc).timestamp()),
             }
 

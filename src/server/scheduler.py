@@ -16,6 +16,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from .config import DATA_HOME
+from .inbox_store import append_event as _append_inbox_event
 
 # ---------------------------------------------------------------------------
 # 路径约定（与 plugins.py 一致，统一使用 agent-harness 独立数据目录 DATA_HOME）
@@ -86,6 +87,46 @@ def _record_run(job: dict, status: str, output: str = "", error: str = "") -> di
     return record
 
 
+def _push_cron_inbox(job: dict, rec: dict) -> None:
+    """cron 终态（成功/失败）后把结果投递到收件箱。
+
+    对齐 QwenPaw 的 save_result_to_inbox 默认 True：cron 结果同时进
+    cron_history（管理面板）与收件箱（会话窗口弹出），不再只藏在独立面板。
+    job 的 save_result_to_inbox 为 False 时跳过（用户显式关闭）。
+    """
+    if not job.get("save_result_to_inbox", True):
+        return
+    status = rec.get("status")
+    if status not in ("success", "failed"):
+        return
+    name = job.get("name") or "定时任务"
+    output = rec.get("output") or ""
+    if status == "success":
+        body = (output or "任务执行成功。")[:2000]
+        title = f"定时任务完成：{name}"
+    else:
+        body = (rec.get("error") or output or "任务失败。")[:2000]
+        title = f"定时任务失败：{name}"
+    try:
+        _append_inbox_event(
+            source_type="cron",
+            source_id=job.get("id"),
+            event_type="cron_result",
+            status=status,
+            severity="info" if status == "success" else "error",
+            title=title,
+            body=body,
+            payload={
+                "job_id": job.get("id"),
+                "job_name": name,
+                "task_type": job.get("task_type") or "command",
+                "run_id": rec.get("id"),
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Agent 任务执行器钩子（由 app.py 在启动时注册）
 # ---------------------------------------------------------------------------
@@ -138,6 +179,7 @@ def _run_job(job: dict) -> dict:
                 _remove_job_from_db(job.get("id"))
             except Exception:
                 pass
+    _push_cron_inbox(job, rec)
     return rec
 
 
@@ -172,6 +214,7 @@ def _run_agent_job(job: dict) -> dict:
             _remove_job_from_db(job.get("id"))
         except Exception:
             pass
+    _push_cron_inbox(job, rec)
     return rec
 
 

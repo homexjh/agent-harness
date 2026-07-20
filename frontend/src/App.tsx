@@ -308,6 +308,9 @@ export default function App() {
   const [activeId, setActiveId] = useState<string>("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [metrics, setMetrics] = useState<any>(null);
+  // 收件箱：定时任务/后台任务结果投递（对齐 QwenPaw 的 /inbox/events，默认弹出在会话窗口）
+  const [inboxEvents, setInboxEvents] = useState<any[]>([]);
+  const [inboxUnread, setInboxUnread] = useState<number>(0);
   // AgentMode（chat/coding/mission）
   const [mode, setMode] = useState<string>(() => localStorage.getItem("harness_mode") || "chat");
   const [modes, setModes] = useState<{ name: string; description: string }[]>([]);
@@ -596,6 +599,47 @@ export default function App() {
       clearInterval(t);
     };
   }, []);
+
+  // 收件箱轮询：拉取 cron 结果事件，渲染进会话窗口（对齐 QwenPaw /inbox/events 默认弹出）
+  const loadInbox = useCallback(() => {
+    apiFetch("/inbox/events?source_type=cron&limit=30")
+      .then((r) => r.json())
+      .then((d) => {
+        const evs = Array.isArray(d.events) ? d.events : [];
+        setInboxEvents(evs);
+        setInboxUnread(typeof d.unread === "number" ? d.unread : 0);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    loadInbox();
+    const t = setInterval(loadInbox, 3000);
+    return () => clearInterval(t);
+  }, [loadInbox]);
+
+  const markInboxRead = useCallback((ids: string[]) => {
+    if (!ids.length) return;
+    apiFetch("/inbox/read", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    })
+      .then(() => loadInbox())
+      .catch(() => {});
+  }, [loadInbox]);
+
+  const markAllInboxRead = useCallback(() => {
+    apiFetch("/inbox/read/all", { method: "POST" })
+      .then(() => loadInbox())
+      .catch(() => {});
+  }, [loadInbox]);
+
+  const dismissInbox = useCallback((id: string) => {
+    apiFetch("/inbox/events/" + id, { method: "DELETE" })
+      .then(() => loadInbox())
+      .catch(() => {});
+  }, [loadInbox]);
 
   // 拉取可用 AgentMode 列表
   useEffect(() => {
@@ -1083,6 +1127,11 @@ export default function App() {
           >
             <span className="nav-icon"><ChatIcon /></span>
             <span>Chat</span>
+            {inboxUnread > 0 && (
+              <span className="nav-badge" title={`${inboxUnread} 条未读定时任务结果`}>
+                {inboxUnread > 99 ? "99+" : inboxUnread}
+              </span>
+            )}
           </button>
         </div>
 
@@ -1159,6 +1208,11 @@ export default function App() {
             ctxInfo={ctxInfo}
             ctxLoading={ctxLoading}
             metrics={metrics}
+            inboxEvents={inboxEvents}
+            inboxUnread={inboxUnread}
+            onMarkInboxRead={markInboxRead}
+            onMarkAllInboxRead={markAllInboxRead}
+            onDismissInbox={dismissInbox}
           />
         )}
         {view === "channels" && <ChannelsPanel />}
@@ -1268,6 +1322,47 @@ function useAutoScroll<T extends HTMLElement>(deps: any[], live = false) {
 }
 
 // ---------------------------------------------------------------------------
+// 收件箱卡片：定时任务 / 后台任务结果，渲染进会话窗口
+// （对齐 QwenPaw：cron 结果默认「弹出」在会话里，而不是只进独立管理面板）
+// ---------------------------------------------------------------------------
+function InboxCard({
+  event,
+  onMarkRead,
+  onDismiss,
+}: {
+  event: any;
+  onMarkRead: () => void;
+  onDismiss: () => void;
+}) {
+  const isUnread = !event.read;
+  const ok = event.status === "success";
+  const ts = event.created_at ? new Date(event.created_at * 1000) : null;
+  const timeStr = ts ? ts.toLocaleString() : "";
+  const body = typeof event.body === "string" ? event.body : JSON.stringify(event.body || "");
+  return (
+    <div className={"inbox-card " + (ok ? "ok" : "err") + (isUnread ? " unread" : " read")}>
+      <div className="inbox-card-head">
+        <span className="inbox-card-icon">{ok ? "✅" : "❌"}</span>
+        <span className="inbox-card-title">{event.title || "定时任务结果"}</span>
+        {isUnread && <span className="inbox-card-unread">未读</span>}
+        <span className="inbox-card-time">{timeStr}</span>
+      </div>
+      <div className="inbox-card-body">{body}</div>
+      <div className="inbox-card-actions">
+        {isUnread && (
+          <button className="ghost small" onClick={onMarkRead}>
+            标记已读
+          </button>
+        )}
+        <button className="ghost small" onClick={onDismiss}>
+          删除
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Chat 视图（原主聊天区）
 // ---------------------------------------------------------------------------
 function ChatView({
@@ -1290,6 +1385,11 @@ function ChatView({
   ctxInfo,
   ctxLoading,
   metrics,
+  inboxEvents,
+  inboxUnread,
+  onMarkInboxRead,
+  onMarkAllInboxRead,
+  onDismissInbox,
 }: any) {
   const { ref: scrollRef, onScroll, scroll, isSticky } = useAutoScroll<HTMLDivElement>([activeSession?.messages.length], streaming);
   return (
@@ -1322,16 +1422,34 @@ function ChatView({
           🧠 上下文
         </button>
         {streaming && <span className="live-dot" title="生成中" />}
+        {inboxUnread > 0 && (
+          <button className="inbox-markall ghost small" onClick={onMarkAllInboxRead} title="标记全部定时任务结果为已读">
+            ✓ 全部已读 ({inboxUnread})
+          </button>
+        )}
       </header>
 
       <div className="messages" id="msg-scroll" ref={scrollRef} onScroll={onScroll}>
-        {(!activeSession || activeSession.messages.length === 0) && !streaming && (
+        {(!activeSession || activeSession.messages.length === 0) && !streaming && inboxEvents.length === 0 && (
           <div className="empty">
             <div className="empty-logo">{BRAND_LOGO}</div>
             <p>发送一条消息开始。试试「桌面上有什么」体验桌面截图 + 看图流程。</p>
           </div>
         )}
         {activeSession?.messages.map((m: Msg) => <MessageBubble key={m.id} m={m} onResume={resume} />)}
+        {inboxEvents.length > 0 && (
+          <div className="inbox-stack">
+            <div className="inbox-stack-head">📨 定时任务结果</div>
+            {inboxEvents.map((ev: any) => (
+              <InboxCard
+                key={ev.id}
+                event={ev}
+                onMarkRead={() => onMarkInboxRead([ev.id])}
+                onDismiss={() => onDismissInbox(ev.id)}
+              />
+            ))}
+          </div>
+        )}
         {!isSticky && (
           <button className="scroll-to-bottom" onClick={() => scroll(true)} title="回到底部">
             ↓ 回到底部

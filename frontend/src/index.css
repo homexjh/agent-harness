@@ -267,6 +267,120 @@ body {
   margin-bottom: 10px;
 }
 
+/* 侧边栏未读角标 */
+.nav-badge {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+}
+
+/* 收件箱卡片（定时任务结果弹出在会话窗口） */
+.inbox-markall {
+  margin-left: 8px;
+}
+.inbox-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 18px;
+  margin-top: 4px;
+}
+.inbox-stack-head {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.inbox-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.inbox-card.unread {
+  border-left: 3px solid var(--accent);
+}
+.inbox-card.read {
+  opacity: 0.72;
+}
+.inbox-card.err.unread {
+  border-left-color: #e5484d;
+}
+.inbox-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--accent-soft);
+}
+.inbox-card.err .inbox-card-head {
+  background: #fdecec;
+}
+.inbox-card-icon {
+  font-size: 15px;
+}
+.inbox-card-title {
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.inbox-card-unread {
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+.inbox-card.err .inbox-card-unread {
+  background: #e5484d;
+}
+.inbox-card-time {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.inbox-card-body {
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.inbox-card-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 7px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+.inbox-card-actions .ghost.small {
+  width: auto;
+  height: auto;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
 .row {
   display: flex;
   padding: 0 18px;
