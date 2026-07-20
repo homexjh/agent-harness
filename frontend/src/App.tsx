@@ -126,6 +126,8 @@ type Session = {
   title: string;
   messages: Msg[];
   updatedAt: number;
+  // 创建时间（createdAt）用于识别"主会话"，inbox 等全局通知只在这里显示
+  createdAt?: number;
 };
 
 type Settings = {
@@ -188,6 +190,8 @@ function readLocalSessions(): Session[] {
             m.reasoning = m.reasoning ? [m.reasoning] : [];
           }
         }
+        // 兼容旧格式：createdAt 缺失时退化为 updatedAt
+        if (!s.createdAt && s.updatedAt) s.createdAt = s.updatedAt;
       }
       return parsed;
     }
@@ -444,6 +448,13 @@ export default function App() {
     [sessions, activeId]
   );
 
+  // "主会话"：创建时间最早的会话，inbox 等全局通知只在这里显示，
+  // 避免新建会话里冒出无关的定时任务结果。
+  const homeSessionId = useMemo(() => {
+    if (!sessions.length) return "";
+    return [...sessions].sort((a, b) => (a.createdAt || a.updatedAt) - (b.createdAt || b.updatedAt))[0].id;
+  }, [sessions]);
+
   // 新建会话：先向后端注册（归属当前用户，写入 sessions 索引），
   // 用后端返回的 thread_id 作为本地会话 id，保证聊天 thread 与后端一致。
   const newSession = useCallback(async (): Promise<string> => {
@@ -461,7 +472,7 @@ export default function App() {
     } catch {
       // 后端不可达时退化为纯本地会话（仍可用，但不进后端索引）
     }
-    const s: Session = { id, title: "新对话", messages: [], updatedAt: Date.now() };
+    const s: Session = { id, title: "新对话", messages: [], updatedAt: Date.now(), createdAt: Date.now() };
     setSessions((prev) => [s, ...prev.filter((x) => x.id !== id)]);
     setActiveId(id);
     setView("chat");
@@ -1210,6 +1221,7 @@ export default function App() {
             metrics={metrics}
             inboxEvents={inboxEvents}
             inboxUnread={inboxUnread}
+            homeSessionId={homeSessionId}
             onMarkInboxRead={markInboxRead}
             onMarkAllInboxRead={markAllInboxRead}
             onDismissInbox={dismissInbox}
@@ -1387,11 +1399,13 @@ function ChatView({
   metrics,
   inboxEvents,
   inboxUnread,
+  homeSessionId,
   onMarkInboxRead,
   onMarkAllInboxRead,
   onDismissInbox,
 }: any) {
   const { ref: scrollRef, onScroll, scroll, isSticky } = useAutoScroll<HTMLDivElement>([activeSession?.messages.length], streaming);
+  const showInbox = activeSession?.id === homeSessionId;
   return (
     <div className="chat">
       <header className="chat-header">
@@ -1430,14 +1444,14 @@ function ChatView({
       </header>
 
       <div className="messages" id="msg-scroll" ref={scrollRef} onScroll={onScroll}>
-        {(!activeSession || activeSession.messages.length === 0) && !streaming && inboxEvents.length === 0 && (
+        {(!activeSession || activeSession.messages.length === 0) && !streaming && !(showInbox && inboxEvents.length > 0) && (
           <div className="empty">
             <div className="empty-logo">{BRAND_LOGO}</div>
             <p>发送一条消息开始。试试「桌面上有什么」体验桌面截图 + 看图流程。</p>
           </div>
         )}
         {activeSession?.messages.map((m: Msg) => <MessageBubble key={m.id} m={m} onResume={resume} />)}
-        {inboxEvents.length > 0 && (
+        {showInbox && inboxEvents.length > 0 && (
           <div className="inbox-stack">
             <div className="inbox-stack-head">📨 定时任务结果</div>
             {inboxEvents.map((ev: any) => (
