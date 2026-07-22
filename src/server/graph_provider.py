@@ -220,8 +220,9 @@ class DemoAgentModel(BaseChatModel):
         s = str(text)
         low = s.lower()
 
-        # 桌面 / 屏幕 / 截图 / 视觉
-        if re.search(r"桌面|屏幕|截图|screenshot|看看.*(桌面|屏幕)|桌面.*什么|屏幕.*什么|窗口|网页|页面", s, re.IGNORECASE):
+        # 桌面 / 屏幕 / 截图 / 视觉（仅明确指向屏幕画面的词才强制截屏，
+        # 不再对裸词"窗口/网页/页面"无差别强制——对齐 QwenPaw 不强推）
+        if re.search(r"桌面|屏幕|截图|screenshot|看看.*(桌面|屏幕)|桌面.*什么|屏幕.*什么", s, re.IGNORECASE):
             return self._with_reasoning(
                 AIMessage(
                     content="",
