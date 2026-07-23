@@ -385,9 +385,16 @@ export default function App() {
   const pendingApprovalRef = useRef<string | null>(null);
   const approvalRequestIdRef = useRef<string | null>(null);
   const modeRef = useRef(mode);
+  // 用户是否手动锁定过 mode：一旦手动切换，前端发送 auto_mode=false，后端不再自动升级。
+  const modeLockedRef = useRef(false);
   const resumeRef = useRef<((d: string) => void) | null>(null);
   activeIdRef.current = activeId;
   modeRef.current = mode;
+  // 用户手动切 mode 时调用：切模式并锁定，使后端不再对后续消息自动升级。
+  const onModeChange = useCallback((m: string) => {
+    setMode(m);
+    modeLockedRef.current = true;
+  }, []);
 
   // 持久化当前视图
   useEffect(() => {
@@ -720,6 +727,13 @@ export default function App() {
         case "warning":
           flash(ev.data?.message || "后端警告");
           break;
+        case "mode_escalate":
+          if (ev.data?.mode && ev.data.mode !== modeRef.current) {
+            setMode(ev.data.mode);
+            modeLockedRef.current = true;
+            flash(`已切换到 ${ev.data.mode} 模式（任务需要重工具）`);
+          }
+          break;
         case "status":
           // 后端保活：图在数秒内无事件流出（pre-LLM 准备等偶发阻塞），
           // 显示「处理中」提示，避免看起来像卡死。
@@ -795,6 +809,7 @@ export default function App() {
           const target = (arg || "").toLowerCase();
           if (["chat", "coding", "mission"].includes(target)) {
             setMode(target);
+            modeLockedRef.current = true;
             flash(`已切换到「${target}」模式`);
           } else {
             flash("用法：/mode chat|coding|mission");
@@ -865,6 +880,7 @@ export default function App() {
         thread_id: sid,
         message: text,
         mode: modeRef.current,
+        auto_mode: !modeLockedRef.current,
         model: settings.model,
         reasoning: settings.reasoning,
         api_key: settings.apiKey,
@@ -1209,6 +1225,7 @@ export default function App() {
             ctxOpen={ctxOpen}
             setCtxOpen={setCtxOpen}
             setMode={setMode}
+            onModeChange={onModeChange}
             set={set}
             toggleReasoning={toggleReasoning}
             newSession={newSession}
@@ -1387,6 +1404,7 @@ function ChatView({
   ctxOpen,
   setCtxOpen,
   setMode,
+  onModeChange,
   set,
   toggleReasoning,
   newSession,
@@ -1418,7 +1436,7 @@ function ChatView({
           </select>
         </div>
         <div className="mode-select" title="AgentMode：切换 Loop Gates 束 + 系统提示 + 工具面">
-          <select value={mode} onChange={(e: any) => setMode(e.target.value)}>
+          <select value={mode} onChange={(e: any) => onModeChange(e.target.value)}>
             {(modes.length ? modes : [{ name: "chat", description: "" }]).map((mo: any) => (
               <option key={mo.name} value={mo.name} title={mo.description}>
                 {mo.name === "chat" ? "💬 对话" : mo.name === "coding" ? "🛠 编码" : mo.name === "mission" ? "🎯 任务" : mo.name}

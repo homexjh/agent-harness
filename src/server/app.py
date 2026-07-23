@@ -608,6 +608,24 @@ async def _run_envelope_impl(thread_id: str, body: dict, user_id: str = "default
         "provider": body.get("provider"),
         "mode": body.get("mode") or "chat",  # chat/coding/mission，切换 Loop Gates 束与系统提示
     }
+    # —— 意图升级（Option C：chat 默认 + 任务自动升级）——
+    # 若前端未手动锁定 mode（auto_mode 为真）且当前为 chat，对用户消息做廉价启发式分类；
+    # 一旦判定为需要文件/命令/编码类重工具的任务，就把会话升到 coding（全工具），
+    # 并下发 mode_escalate 事件让前端同步选择器。保守策略：宁可漏判也不误升。
+    _escalated = False
+    _auto_mode = body.get("auto_mode", True)
+    if _auto_mode and (llm.get("mode") or "chat") == "chat":
+        try:
+            from ..harness.intent import classify_intent
+
+            _msg = (body.get("message") or "").strip()
+            _suggested = classify_intent(_msg)
+            if _suggested not in ("chat", "mission") and _suggested != llm["mode"]:
+                logger.info("INTENT_ESCALATE thread=%s chat->%s msg=%s", thread_id, _suggested, _msg[:40])
+                llm["mode"] = _suggested
+                _escalated = True
+        except Exception:  # noqa: BLE001
+            logger.exception("intent classify failed thread=%s", thread_id)
     try:
         # 图编译（build_graph().compile()）是重 CPU 活；放到线程池执行，
         # 避免阻塞事件循环导致其他聊天请求被卡住（A1 性能修复）。
@@ -666,6 +684,8 @@ async def _run_envelope_impl(thread_id: str, body: dict, user_id: str = "default
         (body.get("message", "") or "")[:60],
     )
     yield sse("meta", {"thread_id": thread_id, "model": llm.get("model") or "demo", "reasoning": actual_reasoning, "mode": llm.get("mode")})
+    if _escalated:
+        yield sse("mode_escalate", {"mode": llm["mode"], "from": "chat", "reason": "intent"})
     if requested_reasoning and not actual_reasoning:
         yield sse(
             "warning",
