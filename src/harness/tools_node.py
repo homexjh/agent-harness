@@ -17,6 +17,7 @@ from .tool_result_store import (
     get_tool_result_store,
     make_placeholder,
 )
+from .security.guard import set_escalation_thread
 
 
 def prune_tool_result(content: str, max_chars: int, *, metrics=None, tool: str = "") -> str:
@@ -81,6 +82,9 @@ def make_tools_node(
         thread_id = "default"
         if config:
             thread_id = (config.get("configurable", {}) or {}).get("thread_id", "default") or "default"
+        # 反应式升级：把当前线程 id 写入守卫可见的 per-request 上下文，
+        # 使 ModeEscalationGuardian 能定位该请求的 mode/locked 状态并回写升级信号。
+        set_escalation_thread(thread_id)
         last = state["messages"][-1]
         outputs = []
         for tc in getattr(last, "tool_calls", []):

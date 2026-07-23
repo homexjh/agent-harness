@@ -1,8 +1,11 @@
-"""按 mode 裁剪工具集（tool profile）测试。
+"""按 mode 给工具面（tool profile）测试。
 
-PoC：闲聊（chat）模式自动关闭会改动环境 / 需审批的重工具
-（exec / write_file / edit_file / desktop_screenshot），保留轻交互工具；
-其余模式（coding / mission）全开，保持旧行为。
+设计（Option C：chat 默认 + 反应式意图升级）：
+- 闲聊（chat）模式**保留**重工具（exec / write_file / edit_file / desktop_screenshot）
+  在 schema 中，但由 ModeEscalationGuardian 在调用时反应式放行 + 升级到 coding；
+  不再物理删除（否则正则漏判时任务静默做不动）。
+- 其余模式（coding / mission）全开，保持旧行为。
+- 用户手动锁定 chat（auto_mode=False）时，守卫改为拒绝重工具（见 test_mode_escalation.py）。
 """
 from __future__ import annotations
 
@@ -19,11 +22,11 @@ def _tool_names(mode: str | None = None):
     return set(tools.keys())
 
 
-def test_chat_profile_disables_heavy_tools():
+def test_chat_profile_keeps_heavy_tools_guarded():
+    # chat 不再物理删除重工具——必须由守卫在调用时反应式升级，否则无法"面面具到"
     names = _tool_names("chat")
-    # 闲聊应关闭的重工具
     for heavy in ("exec", "write_file", "edit_file", "desktop_screenshot"):
-        assert heavy not in names, f"chat profile 不应含 {heavy}"
+        assert heavy in names, f"chat 应保留（守卫托管）重工具 {heavy}"
     # 闲聊应保留的轻交互工具
     for light in (
         "read_file", "list_dir", "get_current_time", "calculator",

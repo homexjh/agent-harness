@@ -42,6 +42,7 @@ from ..harness.security.guard import (
     FilePathGuardian,
     RuleBasedGuardian,
     ShellEvasionGuardian,
+    ModeEscalationGuardian,
 )
 from ..harness.security.guarded_tool import make_guarded_tools
 from ..harness.security.approval import ApprovalGate
@@ -510,16 +511,15 @@ def _parse_tavily(data: dict) -> str:
     return "\n".join(lines).rstrip()
 
 
-# 按会话模式（mode）裁剪工具集：轻量模式（chat）关闭会改动环境 / 需人工审批的重工具，
-# 减少 token 噪音与误触发概率，对齐 QwenPaw「按场景给不同工具面」的思路。
+# 按会话模式（mode）给不同工具面：对齐 QwenPaw「按场景给不同工具面」的思路。
 #
-# 这是位于用户 tools_state 之外的**第二层**门控——profile 关掉的工具，用户在 Tools 面板
-# 也开不回来（属于架构层的轻量化 / 安全裁剪）；tools_state 仍是用户的自由总开关。
-# 闲聊（chat）只需轻交互：读 / 时间 / 搜索 / 记忆 / 召回，不需要 exec / 写文件 / 截屏。
-_TOOL_PROFILE_DISABLE: dict[str, set[str]] = {
-    "chat": {"exec", "write_file", "edit_file", "desktop_screenshot"},
-    # coding / mission 等其余模式：全开（保持旧行为）
-}
+# 早期实现：chat 模式直接把重工具（exec/write_file/edit_file/desktop_screenshot）从
+# schema 里删掉——但这导致"正则漏判时任务静默做不动"，且无法"面面具到"。
+# 现改为：重工具**保留在 chat 的 schema 里**，但包一层 ModeEscalationGuardian
+# （见 harness/security/guard.py）——模型一旦在 chat 下尝试调重工具，守卫放行执行并
+# 同时把会话升到 coding（reaction 事件回传 app.py 下发 mode_escalate）。
+# 这样无论用户怎么措辞，只要任务真需要重工具必被捕获；正则分类器降级为可选优化。
+# 若用户手动锁定 chat（auto_mode=False），守卫改为拒绝重工具以尊重用户选择。
 
 
 def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True, mode: str = "chat"):
@@ -918,11 +918,14 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True,
         description="搜索实时网络信息（新闻、当前事件、最新资料）。返回若干条结果的标题、URL 与内容摘要文本。用于获取『最新热点新闻』『当前事件进展』等训练数据之外的实时信息。当需要国内热点新闻时，搜索词用中文（如『今日国内热点新闻 TOP5』）。",
     )
 
-    # 常规工具：标准三守卫（含 FilePath 沙箱、ShellEvasion）
+    # 常规工具：标准三守卫（含 FilePath 沙箱、ShellEvasion）+ 反应式升级守卫。
+    # ModeEscalationGuardian 置于末尾：安全守卫优先（任一拒绝即拒绝，fail-closed），
+    # 仅当安全放行后、且处于 chat 模式，才触发"放行 + 升级"。
     std_engine = ToolGuardEngine(guardians=[
         FilePathGuardian(allowed_roots=[workdir, os.getcwd()]),
         RuleBasedGuardian(),
         ShellEvasionGuardian(),
+        ModeEscalationGuardian(),
     ])
     guarded = make_guarded_tools(
         [
@@ -945,6 +948,7 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True,
     exec_engine = ToolGuardEngine(guardians=[
         FilePathGuardian(allowed_roots=[workdir, os.getcwd()]),
         RuleBasedGuardian(allowlist={"exec"}),
+        ModeEscalationGuardian(),
     ])
     guarded.update(make_guarded_tools([exec_tool], exec_engine))
     # recall 不绑定具体 cm：调用时按当前用户上下文现取，实现多用户隔离
@@ -957,11 +961,9 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True,
             guarded.setdefault(t.name, t)
     # 根据用户在前端 Tools 面板的开关过滤禁用工具
     guarded = {k: v for k, v in guarded.items() if enabled_map.get(k, True)}
-    # 第二层门控：按 mode 的 profile 裁剪重工具（闲聊不需 exec / 写 / 截屏）。
-    # profile 关掉的工具优先级高于用户的 tools_state 开启，属架构层轻量化裁剪。
-    profile_disabled = _TOOL_PROFILE_DISABLE.get((mode or "chat").strip().lower(), set())
-    if profile_disabled:
-        guarded = {k: v for k, v in guarded.items() if k not in profile_disabled}
+    # 注：不再按 mode 物理删除重工具。chat 模式下的 exec/write_file/edit_file/
+    # desktop_screenshot 仍保留在 schema，由 ModeEscalationGuardian 在调用时
+    # 反应式放行 + 升级到 coding（或用户锁定 chat 时拒绝）。详见文件顶部说明。
     return guarded
 
 

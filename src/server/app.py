@@ -54,6 +54,12 @@ from .plugins import router as plugins_router, _touch_session
 from .settings_api import router as settings_router, apply_envs_on_startup
 from .scheduler import start_scheduler, stop_scheduler, set_agent_runner
 from .approval_hub import get_hub, set_emitter, clear_emitter
+from ..harness.security.guard import (
+    set_request_mode,
+    set_request_locked,
+    pop_escalation,
+    clear_request,
+)
 
 
 # 流式抽取哨兵：图在后台任务跑，主循环从 out_q 抽事件（含内联审批事件）。
@@ -668,6 +674,11 @@ async def _run_envelope_impl(thread_id: str, body: dict, user_id: str = "default
     ck = _ckpt_thread(user_id, thread_id)
     config: dict = {"configurable": {"thread_id": ck, "user_id": user_id}, "recursion_limit": 200}
 
+    # 反应式意图升级：把本请求的当前模式 / 是否手动锁定写入 per-request 状态，
+    # 供 ModeEscalationGuardian 在 chat 下调用重工具时读取并（在需要时）回写升级信号。
+    set_request_mode(ck, llm.get("mode") or "chat")
+    set_request_locked(ck, not _auto_mode)
+
     # 若上一轮审批仍挂起（用户没裁决就发了新消息）：先以「拒绝」解除旧 graph 任务的挂起，
     # 再开始新消息；否则旧任务会一直停在 await future 上。
     try:
@@ -863,6 +874,11 @@ async def _run_envelope_impl(thread_id: str, body: dict, user_id: str = "default
             dict(metrics.gate_triggers or {}), metrics.errors,
         )
         yield sse("metrics", metrics.snapshot())
+        # 反应式升级：图流结束后抽取守卫回写的升级信号（模型在 chat 下调用了重工具）。
+        # 若命中且目标模式与当前不同，下发 mode_escalate 让前端同步切换到 coding 并锁定。
+        _esc_mode = pop_escalation(ck)
+        if _esc_mode and _esc_mode != (llm.get("mode") or "chat"):
+            yield sse("mode_escalate", {"mode": _esc_mode, "from": "chat", "reason": "reactive"})
         yield sse("done", {})
     except Exception as e:  # noqa: BLE001
         metrics.error("stream", "exception")
@@ -872,6 +888,7 @@ async def _run_envelope_impl(thread_id: str, body: dict, user_id: str = "default
     finally:
         # 无论正常/异常，都要清理 emitter 并取消可能仍在 await future 的后台图任务
         clear_emitter(ck)
+        clear_request(ck)
         if graph_task is not None and not graph_task.done():
             graph_task.cancel()
 
