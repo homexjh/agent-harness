@@ -510,7 +510,26 @@ def _parse_tavily(data: dict) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True):
+# 按会话模式（mode）裁剪工具集：粗粒度 profile 门控（对齐 QwenPaw「按场景给不同工具面」）。
+# 这是位于用户 tools_state 之外的第二层门控——profile 关掉的工具，用户在 Tools 面板也开不回来
+# （属于架构层的轻量化 / 安全裁剪）；tools_state 仍是用户的自由总开关。
+# 对话轨（chat）只保留「读 + 联网」轻工具，关闭会改动环境 / 需审批 / 有副作用的重工具：
+#   - 更小 prompt → 首字更快、更省 token（满足「闲聊要更快」）；
+#   - 不产生写文件 / 执行命令 / 截屏等副作用，符合「像跟人聊」的定位。
+# coding / mission 等其余模式：全开（保持旧行为，真正动手干活）。
+_TOOL_PROFILE_DISABLE: dict[str, set[str]] = {
+    "chat": {
+        "write_file",
+        "edit_file",
+        "exec",
+        "desktop_screenshot",
+        "create_timer",
+    },
+    # coding / mission 为空集 → 全开
+}
+
+
+def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True, mode: str = "chat"):
     import os as _os
     import subprocess as _sp
 
@@ -945,6 +964,11 @@ def _build_tools(workdir: str, cm: ContextManager, filter_disabled: bool = True)
             guarded.setdefault(t.name, t)
     # 根据用户在前端 Tools 面板的开关过滤禁用工具
     guarded = {k: v for k, v in guarded.items() if enabled_map.get(k, True)}
+    # 第二层门控：按 mode 的 profile 裁剪重工具（对话轨关写/执行/截屏/定时）。
+    # profile 关掉的工具优先级高于用户的 tools_state 开启，属架构层轻量化裁剪。
+    profile_disabled = _TOOL_PROFILE_DISABLE.get((mode or "chat").strip().lower(), set())
+    if profile_disabled:
+        guarded = {k: v for k, v in guarded.items() if k not in profile_disabled}
     return guarded
 
 
@@ -1175,8 +1199,8 @@ def get_request_graph(llm_overrides: dict) -> tuple[Any, bool]:
     workdir = os.getenv("AGENT_WORKDIR") or str(_workspace_dir())
     os.makedirs(workdir, exist_ok=True)
     cm = get_context_manager()
-    tools = _build_tools(workdir, cm)
-    # Qwen3.6-plus / DeepSeek / o1 / o3 等主流推理模型已支持“思考+工具”并发。
+    tools = _build_tools(workdir, cm, mode=mode)
+    # Qwen3.6-plus / DeepSeek / o1 / o3 等主流推理模型已支持"思考+工具"并发。
     # 不再一刀切关闭 reasoning；若模型本身不兼容，后端会抛 API 错误并由前端显示，
     # 用户可手动关闭 reasoning 开关。
     if api_key:

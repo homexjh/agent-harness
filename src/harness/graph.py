@@ -123,7 +123,9 @@ def make_context_node(context_manager: ContextManager, system_hint: str = None, 
 
         # 长期记忆：只负责"写"（auto_memory 后台线程）；"读/检索注入"已交由
         # MemoryContributor 在系统提示管线里完成，避免此处重复拼装。
-        if mm is not None:
+        # 对话轨（chat）不落记忆：auto_memory 是"写"动作，会带来副作用且同步执行
+        # 时曾阻塞 context_node 数十秒（响应冻结）；对话模式定位为只读交流，跳过即可。
+        if mm is not None and mode != "chat":
             try:
                 _t2 = time.perf_counter()
                 fut = _MEMORY_EXECUTOR.submit(mm.auto_memory, raw, thread_id=thread_id)
