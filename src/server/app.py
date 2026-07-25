@@ -526,23 +526,18 @@ async def replay_thread(
     _auth: str | None = Depends(require_auth),
     _rl: None = Depends(rate_limit),
 ):
-    """从指定 checkpoint 重放（replay）：复用流式聊天，注入 checkpoint_id 作为起点。
+    """从指定 checkpoint 重放（replay）：复用流式聊天信封（_run_envelope），注入 checkpoint_id 作为起点。
 
-    可选 body.input 作为从该步继续的新指令；不传则为纯重放（从该步重新执行后续路径）。
-    底层 _run_stream_impl 已支持从 config.configurable.checkpoint_id 重放。
+    复用与 /api/chat 相同的 SSE 信封（token/reasoning/tool/done），前端无需特殊处理。
+    body 需携带 checkpoint_id 与 input（{messages:[{role,content}]}），并可带
+    model/reasoning/api_key/base_url/provider/mode 即时切换模型（同 /api/chat）。
     """
     body = await request.json()
-    ck = _ckpt_thread(_auth or "default", thread_id)
     cid = body.get("checkpoint_id")
     if not cid:
         return JSONResponse({"ok": False, "error": "checkpoint_id required"}, status_code=400)
-    stream_body = {
-        "input": body.get("input", {}),
-        "config": {"configurable": {"thread_id": ck, "checkpoint_ns": "", "checkpoint_id": cid, "user_id": _auth or "default"}},
-        "stream_mode": ["messages", "values"],
-    }
     return StreamingResponse(
-        _run_stream_impl(thread_id, stream_body, _auth or "default"),
+        _run_envelope(thread_id, body, _auth or "default"),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
@@ -769,13 +764,26 @@ async def _run_envelope_impl(thread_id: str, body: dict, user_id: str = "default
     after_tool_result = False
 
     # 审批走 hub（原地 Future）：前端通过 /api/approval/{thread_id} 决议，不再用 command.resume。
-    input_val = {"messages": [HumanMessage(content=body.get("message", ""))]}
-
-    # 会话索引：用于侧边栏 Sessions 面板（按用户隔离）
-    _touch_session(thread_id, title=body.get("message", "")[:30], user_id=user_id)
-
-    ck = _ckpt_thread(user_id, thread_id)
-    config: dict = {"configurable": {"thread_id": ck, "user_id": user_id}, "recursion_limit": 200}
+    # 重放模式：从指定检查点用提供的 input 重新执行，复用同一套前端信封（token/reasoning/tool）。
+    replay_cid = body.get("checkpoint_id")
+    if replay_cid:
+        input_val = body.get("input") or {"messages": [HumanMessage(content=body.get("message", ""))]}
+        ck = _ckpt_thread(user_id, thread_id)
+        config: dict = {
+            "configurable": {
+                "thread_id": ck,
+                "checkpoint_id": replay_cid,
+                "checkpoint_ns": "",
+                "user_id": user_id,
+            },
+            "recursion_limit": 200,
+        }
+    else:
+        input_val = {"messages": [HumanMessage(content=body.get("message", ""))]}
+        # 会话索引：用于侧边栏 Sessions 面板（按用户隔离）
+        _touch_session(thread_id, title=body.get("message", "")[:30], user_id=user_id)
+        ck = _ckpt_thread(user_id, thread_id)
+        config: dict = {"configurable": {"thread_id": ck, "user_id": user_id}, "recursion_limit": 200}
 
     # 若上一轮审批仍挂起（用户没裁决就发了新消息）：先以「拒绝」解除旧 graph 任务的挂起，
     # 再开始新消息；否则旧任务会一直停在 await future 上。
