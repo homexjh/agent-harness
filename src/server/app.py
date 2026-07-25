@@ -25,6 +25,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -442,9 +443,17 @@ async def thread_history(thread_id: str, _auth: str = Depends(require_auth)):
         logger.warning("history failed thread=%s: %s", ck, e)
         return {"steps": []}
     steps = []
+    prev_n: int | None = None
     for h in items:
         vals = h.values or {}
         msgs = vals.get("messages", []) if isinstance(vals, dict) else []
+        n = len(msgs) if isinstance(msgs, list) else 0
+        # 去重：LangGraph 每节点（context→agent→approval→tools→governor→hitl）
+        # 都写一个 checkpoint，同一用户轮次会产生 N 个 n_messages 相同的快照。
+        # 保留每个连续段里"最新"的那条（即 aget_state_history 返回的倒序首个）。
+        if prev_n is not None and n == prev_n:
+            continue
+        prev_n = n
         last = msgs[-1] if msgs else None
         last_role = getattr(last, "type", None) if last is not None else None
         preview = ""
@@ -455,13 +464,24 @@ async def thread_history(thread_id: str, _auth: str = Depends(require_auth)):
         cc = h.config.get("configurable", {}) if h.config else {}
         pc = h.parent_config.get("configurable", {}) if h.parent_config else {}
         md = h.metadata or {}
+        # created_at：LangGraph metadata 给的是 ISO 字符串，全代码库约定 epoch 秒
+        # （cron/events 都返回 int(time.time())），统一转换便于前端 new Date(x*1000)
+        raw_ts = md.get("created_at") or getattr(h, "created_at", None)
+        ts_num: float | int | None = None
+        if isinstance(raw_ts, (int, float)):
+            ts_num = float(raw_ts)
+        elif isinstance(raw_ts, str):
+            try:
+                ts_num = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+            except Exception:  # noqa: BLE001
+                ts_num = None
         steps.append({
             "checkpoint_id": cc.get("checkpoint_id"),
             "parent_id": pc.get("checkpoint_id"),
             "step": md.get("step"),
-            "created_at": md.get("created_at") or getattr(h, "created_at", None),
+            "created_at": ts_num,
             "next": list(h.next or []),
-            "n_messages": len(msgs) if isinstance(msgs, list) else 0,
+            "n_messages": n,
             "last_role": last_role,
             "preview": preview,
         })
