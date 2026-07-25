@@ -42,6 +42,38 @@ def _reasoning_kwargs(model: str, provider: Optional[str] = None) -> Dict[str, A
     return {}
 
 
+def _no_thinking_kwargs(
+    model: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """非推理模式下，对默认开启 thinking 的厂商显式关闭。
+
+    实测（dashscope 兼容模式 qwen3.6-plus）：不传时接口默认 thinking=ON，
+    每次闲聊会在后台生成大量隐藏推理 token，首字与总耗时翻 ~3 倍
+    （同模型 QwenPaw 显式 enable_thinking=false 约 3s，agent-harness 现网约 10s）。
+    对齐 QwenPaw 行为，闲聊/普通对话关掉它。
+    """
+    low = (model or "").lower()
+    pid = (provider or "").lower()
+    bu = (base_url or "").lower()
+    if pid == "qwen" or "dashscope" in bu or "qwen3" in low or "qwq" in low:
+        return {"enable_thinking": False}
+    return {}
+
+
+def _is_qwen_dashscope(
+    model: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> bool:
+    """判断是否为 dashscope/通义 qwen（默认 thinking=ON，需要自定义模型控制 enable_thinking）。"""
+    low = (model or "").lower()
+    pid = (provider or "").lower()
+    bu = (base_url or "").lower()
+    return pid == "qwen" or "dashscope" in bu or "qwen3" in low or "qwq" in low
+
+
 def make_deepseek_model(
     model: str = "deepseek-v4-pro",
     *,
@@ -89,6 +121,10 @@ def make_deepseek_model(
         if "reasoning" in reasoning_kwargs:
             reasoning_payload = reasoning_kwargs.pop("reasoning")
         model_kwargs = reasoning_kwargs
+    else:
+        # 非推理模式：对默认 thinking=ON 的厂商（qwen/dashscope）显式关闭，
+        # 否则每次闲聊都在后台做隐藏推理，耗时翻数倍。
+        model_kwargs = _no_thinking_kwargs(model, provider, base_url)
 
     chat_kwargs: Dict[str, Any] = dict(
         model=model,
@@ -107,14 +143,14 @@ def make_deepseek_model(
 
     # reasoning 模式需要捕获 reasoning_content；openai 2.x 尚未暴露该字段，
     # 因此使用基于 httpx 的自定义模型，其余场景保持 ChatOpenAI 以获得最大兼容性。
-    if reasoning:
+    if reasoning or _is_qwen_dashscope(model, provider, base_url):
         from .reasoning_model import ReasoningChatOpenAI
         return ReasoningChatOpenAI(
             model=model,
             api_key=api_key,
             base_url=base_url,
-            temperature=1.0,
-            reasoning=True,
+            temperature=(1.0 if reasoning else temperature),
+            reasoning=reasoning,
         )
 
     return ChatOpenAI(**chat_kwargs)

@@ -83,6 +83,7 @@ class ReasoningChatOpenAI(BaseChatModel):
     base_url: str = Field(default="https://api.openai.com/v1", description="OpenAI-compatible endpoint")
     temperature: float = Field(default=0.3)
     reasoning: bool = Field(default=False)
+    max_tokens: Optional[int] = Field(default=None)
     _tools: List[Dict[str, Any]] = []
     _bound: bool = False
 
@@ -90,6 +91,9 @@ class ReasoningChatOpenAI(BaseChatModel):
         """Bind tools just like ChatOpenAI."""
         self._tools = [convert_to_openai_tool(t) for t in tools]
         self._bound = True
+        # 透传 max_tokens（chat 轨用它限制闲聊铺陈，对齐 QwenPaw 的 max_tokens 注入）
+        if "max_tokens" in kwargs:
+            self.max_tokens = kwargs["max_tokens"]
         return self
 
     @property
@@ -127,8 +131,16 @@ class ReasoningChatOpenAI(BaseChatModel):
             "stream": stream,
             "temperature": self.temperature,
         }
+        if self.max_tokens is not None:
+            body["max_tokens"] = self.max_tokens
         if self.reasoning:
+            # 推理模式：开启 thinking（dashscope 兼容模式用 enable_thinking 控制）
             body["reasoning"] = {"type": "enabled"}
+            body["enable_thinking"] = True
+        else:
+            # 非推理模式：对默认 thinking=ON 的厂商显式关闭，避免后台隐藏推理拖慢耗时
+            # （qwen3.x 在 dashscope 兼容模式默认 thinking=ON，不关会让闲聊慢数倍）
+            body["enable_thinking"] = False
         if self._tools:
             body["tools"] = self._tools
             body["tool_choice"] = "auto"

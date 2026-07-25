@@ -35,6 +35,13 @@ from .tool_result_store import get_tool_result_store
 # 同步执行会阻塞 context_node 数十秒（响应冻结）。# QwenPaw 的 auto_memory 是响应路径外的后台维护任务，这里用单线程 executor 对齐。
 _MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ctx-memory")
 
+# 对话轨（chat）单次生成的输出 token 上限。
+# 根因修复：agent-harness 此前对 chat 不设 max_tokens，模型闲聊时会无限铺陈
+# （曾出现「你是谁」吐 846 chunk / 107s）；QwenPaw 给每次对话调用注入 max_tokens，
+# 其日志显示闲聊输出被限制在 ~200-300 token。这里给 chat 设上限，既保留足够
+# 表达空间，又硬性阻止失控长文。coding / mission 不设上限（保持旧行为）。
+CHAT_MAX_TOKENS = 300
+
 
 def _log_memory_exception(fut):
     try:
@@ -61,6 +68,15 @@ def _last_human_text(messages: list) -> str:
             content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
         return (content or "")[:200]
     return ""
+
+
+def _writes_long_term_memory(mode: str) -> bool:
+    """对话轨（chat）不落长期记忆；其余模式写。
+
+    集中表达「chat 跳过 auto_memory」这一不变量，使其有唯一真相源、
+    可被单测锁定，也避免条件散落在闭包里被人改坏。
+    """
+    return (mode or "chat").strip().lower() != "chat"
 
 
 def make_context_node(context_manager: ContextManager, system_hint: str = None, memory_manager=None, core_files_manager=None, mode: str = "chat"):
@@ -125,7 +141,7 @@ def make_context_node(context_manager: ContextManager, system_hint: str = None, 
         # MemoryContributor 在系统提示管线里完成，避免此处重复拼装。
         # 对话轨（chat）不落记忆：auto_memory 是"写"动作，会带来副作用且同步执行
         # 时曾阻塞 context_node 数十秒（响应冻结）；对话模式定位为只读交流，跳过即可。
-        if mm is not None and mode != "chat":
+        if mm is not None and _writes_long_term_memory(mode):
             try:
                 _t2 = time.perf_counter()
                 fut = _MEMORY_EXECUTOR.submit(mm.auto_memory, raw, thread_id=thread_id)
@@ -148,11 +164,21 @@ def make_agent_node(agent_model):
     最终把合并后的 AIMessage 返回给 add_messages reducer。
     """
     async def agent_node(state: dict, config: RunnableConfig) -> dict:
-        logger.info("AGENT_NODE_ENTER thread=%s", (config or {}).get("configurable", {}).get("thread_id", "default"))
+        _tid = (config or {}).get("configurable", {}).get("thread_id", "default")
+        logger.info("AGENT_NODE_ENTER thread=%s", _tid)
         prompt_messages = state.get("prompt_messages") or state.get("messages", [])
         chunks = []
+        _t0 = time.perf_counter()
+        _ttfb = None
         async for chunk in agent_model.astream(prompt_messages):
+            if _ttfb is None:
+                _ttfb = time.perf_counter() - _t0
+                logger.info("AGENT_TTFB thread=%s dt=%.3fs", _tid, _ttfb)
             chunks.append(chunk)
+        if _ttfb is None:
+            _ttfb = time.perf_counter() - _t0
+        _total = time.perf_counter() - _t0
+        logger.info("AGENT_GEN thread=%s total=%.3fs ttfb=%.3fs chunks=%d", _tid, _total, _ttfb, len(chunks))
         if not chunks:
             return {"messages": []}
         final_chunk = chunks[0]
@@ -315,7 +341,13 @@ def build_graph(
     context_manager = context_manager or ContextManager()
     approval_gate = approval_gate or ApprovalGate()
     governor = make_governor(gates, metrics=metrics)
-    agent_model = make_call_model(model, tools=list(tools.values()), metrics=metrics, breaker=breaker)
+    agent_model = make_call_model(
+        model,
+        tools=list(tools.values()),
+        metrics=metrics,
+        breaker=breaker,
+        max_tokens=CHAT_MAX_TOKENS if (mode or "chat").strip().lower() == "chat" else None,
+    )
     tools_node = make_tools_node(tools, metrics=metrics, tool_result_store=get_tool_result_store())
     context_node = make_context_node(context_manager, system_hint=system_hint, memory_manager=memory_manager, core_files_manager=core_files_manager, mode=mode)
     approval_node = make_approval_node(approval_gate)

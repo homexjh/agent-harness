@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import os
+import time
+import logging
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
@@ -17,6 +19,8 @@ from .tool_result_store import (
     get_tool_result_store,
     make_placeholder,
 )
+
+logger = logging.getLogger("agent_harness.tools_node")
 
 
 def prune_tool_result(content: str, max_chars: int, *, metrics=None, tool: str = "") -> str:
@@ -91,6 +95,7 @@ def make_tools_node(
             if tool is None:
                 content = f"Error: unknown tool {name}"
             else:
+                _t_tool = time.perf_counter()
                 try:
                     if hasattr(tool, "invoke"):
                         content = tool.invoke(tc["args"])
@@ -103,6 +108,7 @@ def make_tools_node(
                 except Exception as e:  # noqa: BLE001 - 工具错误回传模型
                     log_event("tool_error", tool=name, error=str(e))
                     content = f"Error: {e}"
+                logger.info("TOOL_EXEC thread=%s tool=%s dt=%.3fs", thread_id, name, time.perf_counter() - _t_tool)
             content = str(content)
             # 第 1 层（执行层外置）：超阈值落盘，否则保持完整 inline。
             content = _externalize_or_inline(

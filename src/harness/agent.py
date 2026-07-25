@@ -103,6 +103,11 @@ class AgentNode(BaseChatModel):
     tools: list = Field(default_factory=list)
     metrics: Optional[Any] = Field(default=None)
     breaker: Optional[Any] = Field(default=None)
+    # 单次生成的最大输出 token 数。None = 不限制（coding/mission 默认）。
+    # 对话轨（chat）设一个上限，防止模型在闲聊时无限铺陈（参考 QwenPaw 给
+    # 每次对话调用注入 max_tokens 的做法，其日志显示闲聊输出被限制在 ~200-300
+    # token；agent-harness 此前不设上限，曾出现「你是谁」狂吐 846 chunk / 107s）。
+    max_tokens: Optional[int] = Field(default=None)
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -167,6 +172,13 @@ class AgentNode(BaseChatModel):
             yield chunk
 
     def _bind_tools(self):
+        # 若设了 max_tokens，把它作为调用参数注入（对齐 QwenPaw 给每次对话
+        # 调用注入 max_tokens 的行为）。tools 非空走 bind_tools，否则走 bind。
+        if self.max_tokens is not None:
+            if self.tools and hasattr(self.model, "bind_tools"):
+                return self.model.bind_tools(self.tools, max_tokens=self.max_tokens)
+            if hasattr(self.model, "bind"):
+                return self.model.bind(max_tokens=self.max_tokens)
         if self.tools and hasattr(self.model, "bind_tools"):
             return self.model.bind_tools(self.tools)
         return self.model
@@ -271,11 +283,15 @@ class AgentNode(BaseChatModel):
         return await bound.ainvoke(messages)
 
 
-def make_call_model(model, *, tools=None, metrics=None, breaker=None):
-    """兼容旧名的工厂函数，返回 AgentNode ChatModel。"""
+def make_call_model(model, *, tools=None, metrics=None, breaker=None, max_tokens=None):
+    """兼容旧名的工厂函数，返回 AgentNode ChatModel。
+
+    max_tokens: 可选的输出 token 上限（仅对话轨 chat 传入，用于限制闲聊铺陈）。
+    """
     return AgentNode(
         model=model,
         tools=list(tools) if tools else [],
         metrics=metrics,
         breaker=breaker,
+        max_tokens=max_tokens,
     )
