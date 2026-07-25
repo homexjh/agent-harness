@@ -141,7 +141,20 @@ class ContextManager:
     def set_active_thread(self, tid) -> None:
         self._active_thread = tid
 
-    # ---- 写穿新消息（幂等：只追加 store 里还没有的） ----
+    # ---- 写穿新消息：把 _store 同步成「当前状态」(raw_messages) ----
+    # 注意：必须支持「变短」——回退(rollback)后 raw_messages 会比 _store 少，
+    # 若只追加，已回退的旧消息会残留在内存 store 里被折叠进 window 发给模型，
+    # 表现为「明明回退了，AI 却还知道/聊起回退点之后的事」(issue: 亿道泄漏)。
+    # 因此每次都按当前 raw_messages 重建 _store，seq 取消息在对话中的下标，
+    # 与 recall / _eviction_index 的 seq 契约保持一致。
+    def _sync_store(self, raw_messages: list, thread_id) -> None:
+        self._store.clear(thread_id)
+        # seq 取 1-based 下标（与原 _persist_new 的 start=existing+1 一致），
+        # 与 recall(seq=N) / _eviction_index 的 seq 契约保持兼容。
+        for i, msg in enumerate(raw_messages, start=1):
+            self._store.append(thread_id, i, msg)
+
+    # 保留旧名以兼容（仅追加、不裁旧消息）——已不再使用，留作历史参考。
     def _persist_new(self, raw_messages: list, thread_id) -> None:
         existing = self._store.count(thread_id)
         for i, msg in enumerate(raw_messages[existing:], start=existing + 1):
@@ -398,7 +411,7 @@ class ContextManager:
     # ---- 对外：准备本轮发送给模型的窗口 ----
     def prepare(self, raw_messages: list, thread_id, system_hint: Optional[str] = None):
         self.set_active_thread(thread_id)
-        self._persist_new(raw_messages, thread_id)
+        self._sync_store(raw_messages, thread_id)
         items = self._store.all(thread_id)
         window, folded_seqs = self._fold(items)
         if self.strip_media:
