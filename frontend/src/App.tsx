@@ -2044,7 +2044,8 @@ function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: strin
   const [suggestIdx, setSuggestIdx] = useState(0);
   const [suggestions, setSuggestions] = useState<{ cmd: string; desc: string }[]>([]);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const skillsCache = useRef<string[] | null>(null);
+  type SkillItem = { id: string; name: string; description: string };
+  const skillsCache = useRef<SkillItem[] | null>(null);
 
   const SLASH_COMMANDS: { cmd: string; desc: string }[] = [
     { cmd: "/skills", desc: "列出可用技能命令" },
@@ -2060,18 +2061,25 @@ function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: strin
     { cmd: "/new", desc: "新建会话" },
   ];
 
-  // 懒加载一次技能列表，用于补全 /<id> 技能命令
+  // 预加载一次技能列表（含名称/描述），用于补全下拉直接展示与选择
   const loadSkills = async () => {
     if (skillsCache.current) return;
     skillsCache.current = [];
     try {
       const r = await apiFetch("/skills");
       const data = await r.json();
-      if (data && Array.isArray(data.skills)) skillsCache.current = data.skills.map((s: any) => s.id).filter(Boolean);
+      if (data && Array.isArray(data.skills)) {
+        skillsCache.current = data.skills
+          .map((s: any) => ({ id: s.id, name: s.name || s.id, description: s.description || "" }))
+          .filter((s: SkillItem) => s.id);
+      }
     } catch {
       skillsCache.current = [];
     }
   };
+
+  // 组件挂载即预加载技能，确保打 / 的瞬间补全里就有技能可选
+  useEffect(() => { loadSkills(); }, []);
 
   const updateSuggestions = (val: string) => {
     if (!val.startsWith("/") || val.includes(" ")) {
@@ -2081,11 +2089,11 @@ function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: strin
     const q = val.toLowerCase();
     const builtins = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q));
     let list = builtins;
-    // 仅当用户输入了多于一个字符（/x）时才混入技能命令，避免一上来列 40+ 条
-    if (q.length > 1 && skillsCache.current) {
+    // 打 / 的瞬间即混入全部技能（带真实名称/描述），方便直接选择；随输入继续过滤
+    if (skillsCache.current) {
       const skillHits = skillsCache.current
-        .filter((id) => ("/" + id).startsWith(q))
-        .map((id) => ({ cmd: "/" + id, desc: "技能命令" }));
+        .filter((s) => ("/" + s.id).startsWith(q))
+        .map((s) => ({ cmd: "/" + s.id, desc: s.name ? `${s.name} — ${s.description}` : "技能命令" }));
       list = [...builtins, ...skillHits];
     }
     setSuggestions(list);

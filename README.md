@@ -148,7 +148,7 @@ examples/             # run_minimal.py / run_stable.py / run_deepseek.py
 - 技能为**按需调用**（on-demand），非后台常驻注入——符合 QwenPaw 的命令形态，也更省上下文。
 - 技能正文来自 `SKILL.md` 去掉 YAML frontmatter 后的部分；扫描/抽取逻辑与 `GET /skills` 共用同一套正则。
 - `/clear` 是真清空：前端 `handleSlash` 现已把 `/clear` 改发 `POST /context/clear`（清持久上下文）+ 本地清空可见会话，不再像旧版仅 `newSession` 假清。
-- `/skills` `/compact` `/skill` `/<id>` `/help` 及未知命令均由前端放行、交给后端 SSE 处理（聊天输入框输入 `/` 会弹出命令补全下拉，含内置命令与已启用技能 `/<id>`）。
+- `/skills` `/compact` `/skill` `/<id>` `/help` 及未知命令均由前端放行、交给后端 SSE 处理。**聊天输入框输入 `/` 的瞬间即弹出补全下拉**：内置命令 + 全部已启用技能（`/<id>`，带真实名称/描述），组件挂载时已预加载 `GET /skills`，无需再敲第二个字符；用 ↑↓ 导航、Tab/Enter 选中即自动填入 `/<id> `，你只需补上任务再回车——这正是「直接显示技能、用户再选择」的交互。
 - `/compact` 需要已配置模型（请求体 `api_key` 或全局 `config.llm.api_key`），否则返回提示而非崩溃。
 
 ---

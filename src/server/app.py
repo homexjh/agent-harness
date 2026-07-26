@@ -773,12 +773,16 @@ def _render_skills_list() -> str:
             "  用户级  ~/.agent-harness/skills/<id>/SKILL.md\n"
             "  项目级  <项目>/.workbuddy/skills/<id>/SKILL.md"
         )
-    lines = ["可用技能命令（输入 /<id> 调用）：", ""]
+    lines = ["可用技能命令（输入 /<id> <任务> 调用，例如 /pdf 总结这篇）：", ""]
     for s in skills:
         name = s.get("name") or s["id"]
         desc = (s.get("description") or "").strip()
         lines.append(f"  /{s['id']}  {name} — {desc}")
-    lines += ["", "内置命令：/skills  /skill <id> <任务>  /clear  /compact  /help"]
+    lines += [
+        "",
+        "内置命令：/skills  /skill <id> <任务>  /clear  /compact  /help",
+        "提示：在输入框输入 / 会直接弹出以上技能补全（带名称/描述），选中即自动填入 /<id>，你只需补上任务再回车。",
+    ]
     return "\n".join(lines)
 
 
