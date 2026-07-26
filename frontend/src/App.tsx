@@ -173,6 +173,58 @@ function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+// 把后端 LangGraph 序列化的消息（human/ai/tool）转成前端 Msg[]。
+// 工具结果（ToolMessage）按 tool_call_id 合并进对应 AI 消息的 toolCalls.result；
+// 思考（additional_kwargs.reasoning_content）降级成单段 reasoning。
+// 用于「回到这里 / 分叉」后把后端真相源同步回前端本地消息。
+function textOf(c: any): string {
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map((p: any) => (p && p.text ? p.text : "")).join("");
+  if (c && typeof c === "object") return JSON.stringify(c);
+  return "";
+}
+function backendMessagesToMsgs(raw: any[]): Msg[] {
+  const toolResults = new Map<string, string>();
+  for (const r of raw || []) {
+    if (r?.type === "tool" || r?.type === "tool_message") {
+      const tcid = r.tool_call_id;
+      if (tcid != null) toolResults.set(tcid, textOf(r.content));
+    }
+  }
+  const out: Msg[] = [];
+  for (const r of raw || []) {
+    const t = r?.type;
+    if (t === "human" || t === "user") {
+      out.push({ id: uid(), role: "user", content: textOf(r.content), toolCalls: [], status: "done" });
+    } else if (t === "ai" || t === "assistant") {
+      const tcs = (r.tool_calls || []).map((tc: any) => ({
+        id: tc.id,
+        name: tc.name,
+        args: tc.args,
+        status: "result" as const,
+        result: tc.id ? toolResults.get(tc.id) : undefined,
+      }));
+      const rk = r.additional_kwargs?.reasoning_content;
+      const reasoning = rk
+        ? [rk]
+        : Array.isArray(r.reasoning)
+          ? r.reasoning
+          : r.reasoning
+            ? [r.reasoning]
+            : [];
+      out.push({
+        id: uid(),
+        role: "ai",
+        content: textOf(r.content),
+        reasoning: reasoning.length ? reasoning : [],
+        toolCalls: tcs,
+        status: "done",
+      });
+    }
+  }
+  return out;
+}
+
 // 读取当前用户的本地会话缓存（含消息，用于显示持久化），兼容旧版全局 key
 function readLocalSessions(): Session[] {
   try {
@@ -322,6 +374,12 @@ export default function App() {
   const [ctxOpen, setCtxOpen] = useState(false);
   const [ctxInfo, setCtxInfo] = useState<any>(null);
   const [ctxLoading, setCtxLoading] = useState(false);
+  // 检查点时间轴面板（checkpoint 回滚 / 分叉 / 重放）
+  const [histOpen, setHistOpen] = useState(false);
+  const [histSteps, setHistSteps] = useState<any[]>([]);
+  const [histLoading, setHistLoading] = useState(false);
+  const [histError, setHistError] = useState<string | null>(null);
+  const [rollingBack, setRollingBack] = useState(false);
   // 逃生舱提示
   const [toast, setToast] = useState<string | null>(null);
   const [settings, setSettings] = useState<Settings>({
@@ -920,6 +978,165 @@ export default function App() {
   );
   resumeRef.current = resume;
 
+  // ---------------------------------------------------------------------------
+  // 检查点时间轴：拉取 / 回滚 / 分叉 / 重放
+  // ---------------------------------------------------------------------------
+  const loadHistory = useCallback(async () => {
+    const sid = activeIdRef.current;
+    if (!sid) return;
+    setHistLoading(true);
+    setHistError(null);
+    try {
+      const r = await apiFetch(`/threads/${encodeURIComponent(sid)}/history`);
+      if (!r.ok) throw new Error((await r.text().catch(() => r.statusText)) || r.statusText);
+      const d = await r.json().catch(() => ({ steps: [] }));
+      setHistSteps(d.steps || []);
+    } catch (e: any) {
+      setHistError(e?.message || "加载失败");
+      setHistSteps([]);
+    } finally {
+      setHistLoading(false);
+    }
+  }, []);
+
+  // 软回滚：移动后端指针到指定检查点（不丢历史），再把后端状态同步回前端本地消息
+  const doRollback = useCallback(
+    async (cid: string) => {
+      const sid = activeIdRef.current;
+      if (!sid || streamingRef.current) return;
+      setRollingBack(true);
+      try {
+        const r = await apiFetch(`/threads/${encodeURIComponent(sid)}/rollback`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ checkpoint_id: cid }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || !d.ok) throw new Error(d.error || r.statusText);
+        const st = await apiFetch(`/threads/${encodeURIComponent(sid)}/state`);
+        const sd = await st.json().catch(() => ({ values: { messages: [] } }));
+        const msgs = backendMessagesToMsgs(sd.values?.messages || []);
+        setSessions((prev) =>
+          prev.map((s) => (s.id === sid ? { ...s, messages: msgs, updatedAt: Date.now() } : s))
+        );
+        flash("已回滚到该检查点 · 已写入的外部文件不会自动撤销");
+      } catch (e: any) {
+        flash("回滚失败：" + (e?.message || "未知错误"));
+      } finally {
+        setRollingBack(false);
+        // 回滚后刷新时间轴（指针已移动）
+        loadHistory();
+      }
+    },
+    [flash, loadHistory]
+  );
+
+  // 分叉：从指定检查点读出完整状态，写入新 thread，并切换到新会话
+  const doFork = useCallback(
+    async (cid: string) => {
+      const sid = activeIdRef.current;
+      if (!sid) return;
+      try {
+        const r = await apiFetch(`/threads/${encodeURIComponent(sid)}/fork`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ checkpoint_id: cid }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || !d.ok) throw new Error(d.error || r.statusText);
+        const newTid = d.thread_id;
+        // 注册新 thread 到后端 sessions 索引（归属当前用户），否则前端切不进去
+        await apiFetch("/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ thread_id: newTid }),
+        }).catch(() => {});
+        const st = await apiFetch(`/threads/${encodeURIComponent(newTid)}/state`);
+        const sd = await st.json().catch(() => ({ values: { messages: [] } }));
+        const msgs = backendMessagesToMsgs(sd.values?.messages || []);
+        setSessions((prev) => [
+          {
+            id: newTid,
+            title: "分叉自 " + sid.slice(0, 8),
+            messages: msgs,
+            updatedAt: Date.now(),
+            createdAt: Date.now(),
+          },
+          ...prev.filter((x) => x.id !== newTid),
+        ]);
+        setActiveId(newTid);
+        setHistOpen(false);
+        flash("已分叉为新会话，可继续聊");
+      } catch (e: any) {
+        flash("分叉失败：" + (e?.message || "未知错误"));
+      }
+    },
+    []
+  );
+
+  // 重放：取该检查点的状态，用当时的最后一条用户输入重新跑一遍图
+  const doReplay = useCallback(
+    async (cid: string) => {
+      const sid = activeIdRef.current;
+      if (!sid || streamingRef.current) return;
+      try {
+        const st = await apiFetch(
+          `/threads/${encodeURIComponent(sid)}/state?checkpoint_id=${encodeURIComponent(cid)}`
+        );
+        const sd = await st.json().catch(() => ({ values: { messages: [] } }));
+        const msgs = sd.values?.messages || [];
+        let lastHuman = "";
+        for (const m of msgs) {
+          if (m?.type === "human" || m?.type === "user") lastHuman = textOf(m.content);
+        }
+        if (!lastHuman) {
+          flash("该检查点没有可重放的用户输入");
+          return;
+        }
+        // 先把本地消息重建为该检查点状态（同回滚），再追加重放的输入与回复
+        const rebuilt = backendMessagesToMsgs(msgs);
+        const aiMsg: Msg = { id: uid(), role: "ai", content: "", reasoning: [], toolCalls: [], status: "streaming" };
+        const userMsg: Msg = { id: uid(), role: "user", content: lastHuman, toolCalls: [], status: "done" };
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === sid
+              ? { ...s, messages: [...rebuilt, userMsg, aiMsg], updatedAt: Date.now() }
+              : s
+          )
+        );
+        streamingRef.current = aiMsg.id;
+        setStreaming(true);
+        await streamChat(
+          `/threads/${encodeURIComponent(sid)}/replay`,
+          {
+            checkpoint_id: cid,
+            input: { messages: [{ role: "user", content: lastHuman }] },
+            model: settings.model,
+            reasoning: settings.reasoning,
+            api_key: settings.apiKey,
+            base_url: settings.baseUrl,
+            provider: settings.provider,
+            mode: modeRef.current,
+          },
+          (ev) => handleEvent(ev, aiMsg.id)
+        );
+      } catch (e: any) {
+        flash("重放失败：" + (e?.message || "未知错误"));
+        setStreaming(false);
+        streamingRef.current = null;
+      } finally {
+        streamingRef.current = null;
+        setStreaming(false);
+      }
+    },
+    [flash, handleEvent, settings]
+  );
+
+  // 打开时间轴面板时自动拉取检查点列表
+  useEffect(() => {
+    if (histOpen) loadHistory();
+  }, [histOpen, activeId, loadHistory]);
+
   // 设置面板逻辑
   const set = (k: string, v: any) => setSettings((f) => ({ ...f, [k]: v }));
   const setRuntime = <G extends keyof RuntimeConfig, K extends keyof RuntimeConfig[G]>(
@@ -1225,6 +1442,16 @@ export default function App() {
             onMarkInboxRead={markInboxRead}
             onMarkAllInboxRead={markAllInboxRead}
             onDismissInbox={dismissInbox}
+            histOpen={histOpen}
+            setHistOpen={setHistOpen}
+            histSteps={histSteps}
+            histLoading={histLoading}
+            histError={histError}
+            rollingBack={rollingBack}
+            onLoadHistory={loadHistory}
+            onRollback={doRollback}
+            onFork={doFork}
+            onReplay={doReplay}
           />
         )}
         {view === "channels" && <ChannelsPanel />}
@@ -1403,6 +1630,17 @@ function ChatView({
   onMarkInboxRead,
   onMarkAllInboxRead,
   onDismissInbox,
+  // checkpoint 时间轴
+  histOpen,
+  setHistOpen,
+  histSteps,
+  histLoading,
+  histError,
+  rollingBack,
+  onLoadHistory,
+  onRollback,
+  onFork,
+  onReplay,
 }: any) {
   const { ref: scrollRef, onScroll, scroll, isSticky } = useAutoScroll<HTMLDivElement>([activeSession?.messages.length], streaming);
   const showInbox = activeSession?.id === homeSessionId;
@@ -1434,6 +1672,9 @@ function ChatView({
         <button className="gear small" onClick={() => setSettingsOpen(true)} title="设置">⚙</button>
         <button className={"ctx-btn" + (ctxOpen ? " active" : "")} onClick={() => setCtxOpen((v: boolean) => !v)} title="上下文检视">
           🧠 上下文
+        </button>
+        <button className={"ctx-btn" + (histOpen ? " active" : "")} onClick={() => setHistOpen((v: boolean) => !v)} title="检查点时间轴 · 回滚 / 分叉 / 重放">
+          🕒 历史
         </button>
         {streaming && <span className="live-dot" title="生成中" />}
         {inboxUnread > 0 && (
@@ -1471,9 +1712,21 @@ function ChatView({
         )}
       </div>
 
-      <Composer streaming={streaming} onSend={sendMessage} />
+      <Composer streaming={streaming || rollingBack} onSend={sendMessage} />
 
       {ctxOpen && <ContextPanel info={ctxInfo} loading={ctxLoading} onRefresh={loadContext} onClose={() => setCtxOpen(false)} metrics={metrics} />}
+      <HistoryPanel
+        open={histOpen}
+        onClose={() => setHistOpen(false)}
+        steps={histSteps}
+        loading={histLoading}
+        error={histError}
+        rollingBack={rollingBack}
+        onRefresh={onLoadHistory}
+        onRollback={onRollback}
+        onFork={onFork}
+        onReplay={onReplay}
+      />
     </div>
   );
 }
@@ -1534,6 +1787,80 @@ function ContextPanel({
         </>
       )}
       {!loading && !info && <div className="muted ctx-pad">暂无上下文数据。</div>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 检查点时间轴面板：列出 checkpoint 步骤，支持回滚 / 分叉 / 重放
+// ---------------------------------------------------------------------------
+function HistoryPanel({
+  open,
+  onClose,
+  steps,
+  loading,
+  error,
+  rollingBack,
+  onRefresh,
+  onRollback,
+  onFork,
+  onReplay,
+}: any) {
+  if (!open) return null;
+  return (
+    <div className="ctx-drawer hist-drawer">
+      <div className="ctx-head">
+        <div className="ctx-title">🕒 检查点时间轴</div>
+        <div className="ctx-head-actions">
+          <button className="ghost small" onClick={onRefresh} title="刷新">↻</button>
+          <button className="ghost small" onClick={onClose} title="关闭">✕</button>
+        </div>
+      </div>
+      <div className="hist-note">回滚只还原对话状态，已写入的外部文件 / 记忆不会自动撤销。</div>
+      {loading && <div className="muted ctx-pad">加载中…</div>}
+      {!loading && error && <div className="hist-error ctx-pad">⚠️ {error}</div>}
+      {!loading && !error && steps.length === 0 && <div className="muted ctx-pad">暂无检查点（先发几条消息）。</div>}
+      <div className="hist-list">
+        {(steps || []).map((s: any, i: number) => (
+          <div key={s.checkpoint_id} className="hist-step">
+            <div className="hist-step-head">
+              <span className="hist-step-idx">#{i + 1}</span>
+              <span className={"hist-step-role " + (s.last_role || "")}>{s.last_role || "—"}</span>
+              <span className="hist-step-msg">{s.n_messages} 条</span>
+              {s.created_at ? (
+                <span className="hist-step-time">{new Date(s.created_at * 1000).toLocaleTimeString()}</span>
+              ) : null}
+            </div>
+            <div className="hist-step-preview">{s.preview || "（空）"}</div>
+            <div className="hist-step-actions">
+              <button
+                className="hist-btn rollback"
+                disabled={rollingBack}
+                onClick={() => onRollback(s.checkpoint_id)}
+                title="软回滚到这一步（移动指针，不丢历史）"
+              >
+                ↺ 回到这里
+              </button>
+              <button
+                className="hist-btn fork"
+                disabled={rollingBack}
+                onClick={() => onFork(s.checkpoint_id)}
+                title="从该检查点分叉出新会话"
+              >
+                ⑂ 分叉
+              </button>
+              <button
+                className="hist-btn replay"
+                disabled={rollingBack}
+                onClick={() => onReplay(s.checkpoint_id)}
+                title="用当时的输入从该检查点重放一次"
+              >
+                ▶ 重放
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

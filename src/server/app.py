@@ -25,6 +25,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -382,9 +383,11 @@ async def reset_thread(thread_id: str, _auth: str = Depends(require_auth)):
 
 @app.get("/threads/{thread_id}/state")
 @app.post("/threads/{thread_id}/state")
-async def get_state(thread_id: str, _auth: str = Depends(require_auth)):
+async def get_state(thread_id: str, checkpoint_id: str = None, _auth: str = Depends(require_auth)):
     graph = get_graph()
-    cfg = {"configurable": {"thread_id": _ckpt_thread(_auth, thread_id)}}
+    cfg = {"configurable": {"thread_id": _ckpt_thread(_auth, thread_id), "checkpoint_ns": ""}}
+    if checkpoint_id:
+        cfg["configurable"]["checkpoint_id"] = checkpoint_id
     try:
         snap = await graph.aget_state(cfg)
     except Exception:
@@ -419,6 +422,145 @@ async def get_state(thread_id: str, _auth: str = Depends(require_auth)):
         "checkpoint": snap.config or {"thread_id": thread_id},
         "parent_checkpoint": snap.parent_config,
     }
+
+
+# ===== checkpoint 回滚（LangGraph time-travel）原语 =====
+# 全部 mode（chat/coding/mission）通用。底层用 aget_state_history / aupdate_state /
+# ainvoke(target_cfg) 实现，与具体模式无关（mode 是 AgentState 的一个字段，随状态一并恢复）。
+
+@app.get("/threads/{thread_id}/history")
+async def thread_history(thread_id: str, _auth: str = Depends(require_auth)):
+    """返回该 thread 所有 checkpoint 步骤（倒序），供时间轴/回滚选择。
+
+    注意：LangGraph 每次 ainvoke 会产生多个 node 级 checkpoint（每个 super-step 一个），
+    所以 steps 数 != 用户轮次。前端需按 messages 数 / next 节点映射到"用户轮次"粒度。
+    """
+    ck = _ckpt_thread(_auth, thread_id)
+    graph = get_graph()
+    try:
+        items = [h async for h in graph.aget_state_history({"configurable": {"thread_id": ck}})]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("history failed thread=%s: %s", ck, e)
+        return {"steps": []}
+    steps = []
+    prev_n: int | None = None
+    for h in items:
+        vals = h.values or {}
+        msgs = vals.get("messages", []) if isinstance(vals, dict) else []
+        n = len(msgs) if isinstance(msgs, list) else 0
+        # 去重：LangGraph 每节点（context→agent→approval→tools→governor→hitl）
+        # 都写一个 checkpoint，同一用户轮次会产生 N 个 n_messages 相同的快照。
+        # 保留每个连续段里"最新"的那条（即 aget_state_history 返回的倒序首个）。
+        if prev_n is not None and n == prev_n:
+            continue
+        prev_n = n
+        last = msgs[-1] if msgs else None
+        last_role = getattr(last, "type", None) if last is not None else None
+        preview = ""
+        if last is not None:
+            c = getattr(last, "content", "")
+            preview = c if isinstance(c, str) else str(c)
+            preview = preview[:80]
+        cc = h.config.get("configurable", {}) if h.config else {}
+        pc = h.parent_config.get("configurable", {}) if h.parent_config else {}
+        md = h.metadata or {}
+        # created_at：LangGraph metadata 给的是 ISO 字符串，全代码库约定 epoch 秒
+        # （cron/events 都返回 int(time.time())），统一转换便于前端 new Date(x*1000)
+        raw_ts = md.get("created_at") or getattr(h, "created_at", None)
+        ts_num: float | int | None = None
+        if isinstance(raw_ts, (int, float)):
+            ts_num = float(raw_ts)
+        elif isinstance(raw_ts, str):
+            try:
+                ts_num = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+            except Exception:  # noqa: BLE001
+                ts_num = None
+        steps.append({
+            "checkpoint_id": cc.get("checkpoint_id"),
+            "parent_id": pc.get("checkpoint_id"),
+            "step": md.get("step"),
+            "created_at": ts_num,
+            "next": list(h.next or []),
+            "n_messages": n,
+            "last_role": last_role,
+            "preview": preview,
+        })
+    return {"steps": steps}
+
+
+@app.post("/threads/{thread_id}/rollback")
+async def rollback_thread(thread_id: str, payload: dict = {}, _auth: str = Depends(require_auth)):
+    """软回滚：把当前指针移动到指定 checkpoint（历史不丢，只移动指针）。
+
+    等价于 git reset --soft：对话状态回到那一步，后续生成从那步继续。
+    实现：aupdate_state(target_cfg, {}) —— 以目标 checkpoint 为父生成新 checkpoint（复制其状态）。
+    若目标步之后存在 pending HITL 审批，清理旧登记避免复活失效审批。
+    """
+    ck = _ckpt_thread(_auth, thread_id)
+    cid = payload.get("checkpoint_id")
+    if not cid:
+        return JSONResponse({"ok": False, "error": "checkpoint_id required"}, status_code=400)
+    graph = get_graph()
+    target_cfg = {"configurable": {"thread_id": ck, "checkpoint_ns": "", "checkpoint_id": cid}}
+    try:
+        await graph.aupdate_state(target_cfg, {})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("rollback failed thread=%s cid=%s: %s", ck, cid, e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    try:
+        get_hub().clear_thread(ck)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "thread_id": thread_id, "checkpoint_id": cid}
+
+
+@app.post("/threads/{thread_id}/fork")
+async def fork_thread(thread_id: str, payload: dict = {}, _auth: str = Depends(require_auth)):
+    """从指定 checkpoint 分叉出新 thread（原线完整保留）。
+
+    实现：读目标步完整状态 -> 写入新 thread（复制 messages/gate_state/turn/mode 等）。
+    跨 thread 复制用"读值 + 写新 thread"，而非引用其他 thread 的 checkpoint_id（不跨 thread 生效）。
+    """
+    ck = _ckpt_thread(_auth, thread_id)
+    cid = payload.get("checkpoint_id")
+    if not cid:
+        return JSONResponse({"ok": False, "error": "checkpoint_id required"}, status_code=400)
+    new_tid = payload.get("new_thread_id") or (thread_id + "-fork-" + uuid.uuid4().hex[:8])
+    new_ck = _ckpt_thread(_auth, new_tid)
+    graph = get_graph()
+    target_cfg = {"configurable": {"thread_id": ck, "checkpoint_ns": "", "checkpoint_id": cid}}
+    try:
+        snap = await graph.aget_state(target_cfg)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    if snap is None or snap.values is None:
+        return JSONResponse({"ok": False, "error": "checkpoint not found"}, status_code=404)
+    await graph.aupdate_state({"configurable": {"thread_id": new_ck, "checkpoint_ns": ""}}, dict(snap.values))
+    return {"ok": True, "thread_id": new_tid, "source_checkpoint_id": cid}
+
+
+@app.post("/threads/{thread_id}/replay")
+async def replay_thread(
+    thread_id: str,
+    request: Request,
+    _auth: str | None = Depends(require_auth),
+    _rl: None = Depends(rate_limit),
+):
+    """从指定 checkpoint 重放（replay）：复用流式聊天信封（_run_envelope），注入 checkpoint_id 作为起点。
+
+    复用与 /api/chat 相同的 SSE 信封（token/reasoning/tool/done），前端无需特殊处理。
+    body 需携带 checkpoint_id 与 input（{messages:[{role,content}]}），并可带
+    model/reasoning/api_key/base_url/provider/mode 即时切换模型（同 /api/chat）。
+    """
+    body = await request.json()
+    cid = body.get("checkpoint_id")
+    if not cid:
+        return JSONResponse({"ok": False, "error": "checkpoint_id required"}, status_code=400)
+    return StreamingResponse(
+        _run_envelope(thread_id, body, _auth or "default"),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 def _extract_stream_bits(msg_chunk: Any):
@@ -477,7 +619,7 @@ async def _run_stream_impl(thread_id: str, body: dict, user_id: str = "default")
     if "values" not in modes:
         modes = list(modes) + ["values"]
 
-    config: dict = {"configurable": {"thread_id": _ckpt_thread(user_id, thread_id), "user_id": user_id}, "recursion_limit": 200}
+    config: dict = {"configurable": {"thread_id": _ckpt_thread(user_id, thread_id), "user_id": user_id, "checkpoint_ns": ""}, "recursion_limit": 200}
     bcfg = body.get("config") or {}
     if isinstance(bcfg, dict):
         config["configurable"].update(bcfg.get("configurable", {}))
@@ -642,13 +784,26 @@ async def _run_envelope_impl(thread_id: str, body: dict, user_id: str = "default
     after_tool_result = False
 
     # 审批走 hub（原地 Future）：前端通过 /api/approval/{thread_id} 决议，不再用 command.resume。
-    input_val = {"messages": [HumanMessage(content=body.get("message", ""))]}
-
-    # 会话索引：用于侧边栏 Sessions 面板（按用户隔离）
-    _touch_session(thread_id, title=body.get("message", "")[:30], user_id=user_id)
-
-    ck = _ckpt_thread(user_id, thread_id)
-    config: dict = {"configurable": {"thread_id": ck, "user_id": user_id}, "recursion_limit": 200}
+    # 重放模式：从指定检查点用提供的 input 重新执行，复用同一套前端信封（token/reasoning/tool）。
+    replay_cid = body.get("checkpoint_id")
+    if replay_cid:
+        input_val = body.get("input") or {"messages": [HumanMessage(content=body.get("message", ""))]}
+        ck = _ckpt_thread(user_id, thread_id)
+        config: dict = {
+            "configurable": {
+                "thread_id": ck,
+                "checkpoint_id": replay_cid,
+                "checkpoint_ns": "",
+                "user_id": user_id,
+            },
+            "recursion_limit": 200,
+        }
+    else:
+        input_val = {"messages": [HumanMessage(content=body.get("message", ""))]}
+        # 会话索引：用于侧边栏 Sessions 面板（按用户隔离）
+        _touch_session(thread_id, title=body.get("message", "")[:30], user_id=user_id)
+        ck = _ckpt_thread(user_id, thread_id)
+        config: dict = {"configurable": {"thread_id": ck, "user_id": user_id}, "recursion_limit": 200}
 
     # 若上一轮审批仍挂起（用户没裁决就发了新消息）：先以「拒绝」解除旧 graph 任务的挂起，
     # 再开始新消息；否则旧任务会一直停在 await future 上。
