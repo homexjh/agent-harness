@@ -592,6 +592,7 @@ body {
 
 /* ---------------- 输入区 ---------------- */
 .composer {
+  position: relative;
   border-top: 1px solid var(--border);
   background: var(--panel);
   padding: 14px 18px;
@@ -622,6 +623,45 @@ body {
 .composer button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ---------------- 斜杠命令补全下拉 ---------------- */
+.slash-suggest {
+  position: absolute;
+  bottom: 100%;
+  left: 18px;
+  right: 18px;
+  margin-bottom: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(20, 24, 40, 0.16);
+  list-style: none;
+  padding: 4px;
+  max-height: 280px;
+  overflow-y: auto;
+  z-index: 50;
+}
+.slash-suggest li {
+  display: flex;
+  flex-direction: column;
+  padding: 7px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.slash-suggest li.active,
+.slash-suggest li:hover {
+  background: var(--accent-soft);
+}
+.slash-suggest .sc-cmd {
+  font-weight: 600;
+  color: var(--accent);
+}
+.slash-suggest .sc-desc {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 2px;
 }
 
 /* ---------------- 设置弹窗 ---------------- */

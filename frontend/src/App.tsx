@@ -869,11 +869,29 @@ export default function App() {
           apiFetch("/metrics").then((r) => r.json()).then(setMetrics).catch(() => {});
           flash("已刷新性能指标");
           return true;
-        case "clear":
         case "new":
           newSession();
           flash("已新建会话");
           return true;
+        case "clear": {
+          // 真清空：后端清持久上下文（POST /context/clear）+ 前端清可见会话
+          const sid = activeIdRef.current;
+          if (sid) {
+            apiFetch("/context/clear", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ thread_id: sid }),
+            })
+              .then(() => flash("已清空本会话上下文"))
+              .catch(() => flash("清空失败（后端不可用）"));
+            setSessions((prev) =>
+              prev.map((s) => (s.id === sid ? { ...s, messages: [], title: "新对话" } : s))
+            );
+          } else {
+            flash("没有可清空的会话");
+          }
+          return true;
+        }
         case "reject":
         case "approve":
           if (pendingApprovalRef.current) {
@@ -883,14 +901,14 @@ export default function App() {
           }
           return true;
         case "help":
-          flash("命令：/mode /context /metrics /clear /approve /reject /help");
-          return true;
+          // 交给后端返回完整帮助（AI 消息形式展示）
+          return false;
         default:
-          flash(`未知命令：/${cmd}（试试 /help）`);
-          return true;
+          // 其余（/skills /compact /skill /<id> /未知命令）→ 交给后端 SSE 处理
+          return false;
       }
     },
-    [flash, loadContext, newSession]
+    [flash, loadContext, newSession, activeIdRef]
   );
 
   const sendMessage = useCallback(
@@ -2015,9 +2033,63 @@ const MessageBubble = memo(function MessageBubble({ m, onResume }: { m: Msg; onR
 // ---------------------------------------------------------------------------
 function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: string) => void }) {
   const [input, setInput] = useState("");
-  const submit = () => {
-    const t = input.trim();
+  const [showSuggest, setShowSuggest] = useState(false);
+  const [suggestIdx, setSuggestIdx] = useState(0);
+  const [suggestions, setSuggestions] = useState<{ cmd: string; desc: string }[]>([]);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const skillsCache = useRef<string[] | null>(null);
+
+  const SLASH_COMMANDS: { cmd: string; desc: string }[] = [
+    { cmd: "/skills", desc: "列出可用技能命令" },
+    { cmd: "/skill", desc: "<id> <任务> 调用技能" },
+    { cmd: "/clear", desc: "清空本会话上下文" },
+    { cmd: "/compact", desc: "压缩会话为摘要" },
+    { cmd: "/help", desc: "显示帮助" },
+    { cmd: "/mode", desc: "chat|coding|mission 切换模式" },
+    { cmd: "/context", desc: "打开上下文面板" },
+    { cmd: "/metrics", desc: "刷新性能指标" },
+    { cmd: "/approve", desc: "通过当前审批" },
+    { cmd: "/reject", desc: "拒绝当前审批" },
+    { cmd: "/new", desc: "新建会话" },
+  ];
+
+  // 懒加载一次技能列表，用于补全 /<id> 技能命令
+  const loadSkills = async () => {
+    if (skillsCache.current) return;
+    skillsCache.current = [];
+    try {
+      const r = await apiFetch("/skills");
+      const data = await r.json();
+      if (data && Array.isArray(data.skills)) skillsCache.current = data.skills.map((s: any) => s.id).filter(Boolean);
+    } catch {
+      skillsCache.current = [];
+    }
+  };
+
+  const updateSuggestions = (val: string) => {
+    if (!val.startsWith("/") || val.includes(" ")) {
+      setShowSuggest(false);
+      return;
+    }
+    const q = val.toLowerCase();
+    const builtins = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q));
+    let list = builtins;
+    // 仅当用户输入了多于一个字符（/x）时才混入技能命令，避免一上来列 40+ 条
+    if (q.length > 1 && skillsCache.current) {
+      const skillHits = skillsCache.current
+        .filter((id) => ("/" + id).startsWith(q))
+        .map((id) => ({ cmd: "/" + id, desc: "技能命令" }));
+      list = [...builtins, ...skillHits];
+    }
+    setSuggestions(list);
+    setShowSuggest(list.length > 0);
+    setSuggestIdx(0);
+  };
+
+  const submit = (override?: string) => {
+    const t = (override ?? input).trim();
     if (!t) return;
+    setShowSuggest(false);
     if (streaming) {
       // 让 sendMessage 统一提示，输入框保留文字
       onSend(t);
@@ -2026,15 +2098,80 @@ function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: strin
     setInput("");
     onSend(t);
   };
+
+  const acceptSuggestion = (s: string) => {
+    setInput(s + " ");
+    setShowSuggest(false);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (showSuggest && suggestions.length) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSuggestIdx((i) => (i + 1) % suggestions.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSuggestIdx((i) => (i - 1 + suggestions.length) % suggestions.length);
+        return;
+      }
+      if (e.key === "Tab") {
+        e.preventDefault();
+        acceptSuggestion(suggestions[suggestIdx].cmd);
+        return;
+      }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        const exact = suggestions.length === 1 && suggestions[0].cmd === input.trim();
+        if (exact) submit();
+        else acceptSuggestion(suggestions[suggestIdx].cmd);
+        return;
+      }
+      if (e.key === "Escape") {
+        setShowSuggest(false);
+        return;
+      }
+    }
+    if (e.key === "Enter") submit();
+  };
+
+  const onChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const v = e.target.value;
+    setInput(v);
+    if (v.startsWith("/")) loadSkills();
+    updateSuggestions(v);
+  };
+
   return (
     <div className="composer">
+      {showSuggest && (
+        <ul className="slash-suggest">
+          {suggestions.map((s, i) => (
+            <li
+              key={s.cmd}
+              className={i === suggestIdx ? "active" : ""}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                acceptSuggestion(s.cmd);
+              }}
+              onMouseEnter={() => setSuggestIdx(i)}
+            >
+              <span className="sc-cmd">{s.cmd}</span>
+              <span className="sc-desc">{s.desc}</span>
+            </li>
+          ))}
+        </ul>
+      )}
       <input
+        ref={inputRef}
         value={input}
-        placeholder={streaming ? "AI 回复中，可继续输入下一条…" : "输入消息，回车发送…（/help 查看命令）"}
-        onChange={(e) => setInput(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && submit()}
+        placeholder={streaming ? "AI 回复中，可继续输入下一条…" : "输入消息，回车发送…（输入 / 查看命令）"}
+        onChange={onChange}
+        onKeyDown={onKeyDown}
       />
-      <button onClick={submit} disabled={streaming || !input.trim()}>发送</button>
+      <button onClick={() => submit()} disabled={streaming || !input.trim()}>发送</button>
     </div>
   );
 }
