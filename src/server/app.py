@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 import time
 import uuid
@@ -34,7 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from langgraph.types import Command
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from .graph_provider import (
     get_assistant_id,
@@ -723,6 +724,194 @@ def _delta(prev: str, cur: str) -> str:
     return cur
 
 
+# ---------------------------------------------------------------------------
+# 斜杠命令路由（QwenPaw 式：/skills /skill /<id> /clear /compact /help）
+# 设计：按需调用模型。技能正文作为 SystemMessage 预置到本轮输入，随会话激活；
+#       /clear 真清空上下文；/compact 用 LLM 把会话压缩为摘要基线。
+# ---------------------------------------------------------------------------
+def _iter_skills(user_id: str):
+    """yield (scope, info) for enabled skills (user-level + project-level)."""
+    from .plugins import _scan_skill_dir, _workbuddy_dir, _skills_state
+
+    project = Path.cwd() / ".workbuddy" / "skills"
+    user = _workbuddy_dir() / "skills"
+    state = _skills_state()
+    for info in _scan_skill_dir(user, "system") + _scan_skill_dir(project, "project"):
+        key = f"{info['scope']}:{info['id']}"
+        if not state.get("skills", {}).get(key, {}).get("enabled", True):
+            continue
+        yield info["scope"], info
+
+
+def _load_skill_body(scope: str, skill_id: str):
+    """读取 SKILL.md 的正文（去掉 YAML frontmatter）。找不到返回 None。"""
+    from .plugins import _workbuddy_dir
+
+    base = (_workbuddy_dir() / "skills") if scope == "system" else (Path.cwd() / ".workbuddy" / "skills")
+    md = base / skill_id / "SKILL.md"
+    if not md.exists():
+        return None
+    text = md.read_text(encoding="utf-8")
+    fm = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.DOTALL)
+    return (fm.group(2).strip() if fm else text.strip())
+
+
+def _find_skill(sid: str, user_id: str):
+    sid_l = (sid or "").lower()
+    for scope, info in _iter_skills(user_id):
+        if info["id"].lower() == sid_l:
+            return info
+    return None
+
+
+def _render_skills_list() -> str:
+    skills = [info for _, info in _iter_skills("default")]
+    if not skills:
+        return (
+            "（暂无可用技能）\n"
+            "把技能放到：\n"
+            "  用户级  ~/.agent-harness/skills/<id>/SKILL.md\n"
+            "  项目级  <项目>/.workbuddy/skills/<id>/SKILL.md"
+        )
+    lines = ["可用技能命令（输入 /<id> 调用）：", ""]
+    for s in skills:
+        name = s.get("name") or s["id"]
+        desc = (s.get("description") or "").strip()
+        lines.append(f"  /{s['id']}  {name} — {desc}")
+    lines += ["", "内置命令：/skills  /skill <id> <任务>  /clear  /compact  /help"]
+    return "\n".join(lines)
+
+
+def _render_help() -> str:
+    return (
+        "内置斜杠命令：\n"
+        "  /skills              列出可用技能命令\n"
+        "  /skill <id> <任务>   调用指定技能（如 /pdf 总结这篇）\n"
+        "  /<id> <任务>         同上，直接以技能 id 调用\n"
+        "  /clear               清空本会话上下文（折叠区原文一并丢弃）\n"
+        "  /compact [补充要求]  用 LLM 将本会话压缩为摘要，保留关键信息\n"
+        "  /help                显示本帮助\n"
+        "\n说明：技能为按需调用；本会话调用后其说明会保持激活，直到你 /clear。"
+    )
+
+
+def _resolve_skill_invocation(spec: str, user_id: str) -> dict:
+    parts = spec.split(maxsplit=1)
+    sid = parts[0]
+    task = parts[1].strip() if len(parts) > 1 else ""
+    skill = _find_skill(sid, user_id)
+    if not skill:
+        return {"kind": "direct", "text": f"未找到技能：{sid}\n输入 /skills 查看可用技能。"}
+    body_text = _load_skill_body(skill["scope"], skill["id"])
+    if body_text is None:
+        return {"kind": "direct", "text": f"技能 {sid} 的 SKILL.md 无法读取。"}
+    hint = (
+        f"你正在使用一个名为「{skill.get('name') or sid}」的技能。"
+        f"请严格遵循以下技能说明完成任务：\n\n{body_text}"
+    )
+    return {"kind": "skill", "skill_body": hint, "task": task or "请根据上方技能说明开始工作。"}
+
+
+def _parse_slash(raw_msg: str, user_id: str) -> dict:
+    s = raw_msg[1:].strip()
+    if not s:
+        return {"kind": "direct", "text": "空命令。输入 /skills 查看可用技能，/help 查看内置命令。"}
+    parts = s.split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if cmd == "skills":
+        return {"kind": "direct", "text": _render_skills_list()}
+    if cmd == "skill":
+        if not arg:
+            return {"kind": "direct", "text": "用法：/skill <技能id> <你的任务>\n输入 /skills 查看可用技能。"}
+        return _resolve_skill_invocation(arg, user_id)
+    if cmd == "clear":
+        return {"kind": "clear"}
+    if cmd == "compact":
+        return {"kind": "compact", "prompt": arg}
+    if cmd in ("help", "?"):
+        return {"kind": "direct", "text": _render_help()}
+    # 直接以技能 id 调用：/<id> <任务>
+    skill = _find_skill(cmd, user_id)
+    if skill:
+        return _resolve_skill_invocation(f"{cmd} {arg}", user_id)
+    return {"kind": "direct", "text": f"未知命令：/{cmd}\n输入 /skills 查看可用技能，/help 查看内置命令。"}
+
+
+def _make_model_for_request(body: dict):
+    """按请求体（缺省回退全局配置）构造一个非流式 LLM，用于 /compact 总结。"""
+    from ..harness.models import make_deepseek_model
+
+    model = (body.get("model") or "").strip()
+    api_key = (body.get("api_key") or "").strip()
+    base_url = body.get("base_url") or None
+    reasoning = bool(body.get("reasoning"))
+    provider = (body.get("provider") or "").strip()
+    if not api_key:
+        from .config import get_config
+
+        cfg = get_config()
+        api_key = (cfg.llm.get("api_key") or "").strip()
+        if not model:
+            model = (cfg.llm.get("model") or "deepseek-chat").strip()
+        if not base_url:
+            base_url = cfg.llm.get("base_url") or None
+        reasoning = reasoning or bool(cfg.llm.get("reasoning", False))
+        provider = provider or (cfg.llm.get("provider") or "").strip()
+    if not api_key:
+        return None
+    return make_deepseek_model(
+        model=model, api_key=api_key, base_url=base_url,
+        streaming=False, reasoning=reasoning, provider=provider,
+    )
+
+
+def _msg_text(m) -> str:
+    if isinstance(m, dict):
+        c = m.get("content", "")
+    else:
+        c = getattr(m, "content", "")
+    if isinstance(c, list):
+        return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in c)
+    return c or ""
+
+
+async def _do_compact(prompt: str, thread_id: str, user_id: str, body: dict) -> str:
+    """用 LLM 把本会话压缩为摘要，清空后以单条 HumanMessage 基线写回。"""
+    cm = get_context_manager(user_id)
+    tid = f"{user_id}:{thread_id}"
+    rows = cm._store.all(tid)
+    if not rows:
+        return "（本会话暂无内容可压缩。）"
+    transcript = []
+    for it in rows:
+        transcript.append(f"[{it['msg'].get('type', '?')}] {_msg_text(it['msg'])}")
+    text = "\n".join(transcript)
+    model = _make_model_for_request(body)
+    if model is None:
+        return "（未配置模型，无法压缩。请先在设置中配置 API Key。）"
+    summary_prompt = (
+        "请把以下对话记录压缩为简洁的结构化摘要，保留所有关键事实、决策、待办事项与用户偏好，"
+        "去除寒暄与冗余。\n\n"
+        f"{text}\n\n"
+        f"用户补充要求：{prompt or '无'}\n\n只输出摘要本身。"
+    )
+    try:
+        resp = await model.ainvoke([HumanMessage(content=summary_prompt)])
+        summary = resp.content if hasattr(resp, "content") else str(resp)
+        if isinstance(summary, list):
+            summary = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in summary)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("compact failed thread=%s", thread_id)
+        return f"压缩失败：{exc}"
+    cm.clear(tid)
+    cm._store.append(tid, 1, HumanMessage(content=f"[对话摘要]\n{summary}"))
+    return (
+        f"已压缩本会话为摘要（原 {len(rows)} 条 → 1 条摘要）。\n\n"
+        f"摘要预览：\n{summary[:600]}"
+    )
+
+
 async def _run_envelope(thread_id: str, body: dict, user_id: str = "default"):
     """QwenPaw 式自研 SSE 信封（包装 _run_envelope_impl，注入当前用户上下文实现多用户隔离）。"""
     async for chunk in _with_user(user_id, _run_envelope_impl(thread_id, body)):
@@ -750,6 +939,36 @@ async def _run_envelope_impl(thread_id: str, body: dict, user_id: str = "default
         "provider": body.get("provider"),
         "mode": body.get("mode") or "chat",  # chat/coding/mission，切换 Loop Gates 束与系统提示
     }
+
+    # ---- 斜杠命令路由（QwenPaw 式：/skills /skill /<id> /clear /compact） ----
+    skill_system_msg = None
+    _raw_msg = (body.get("message") or "").strip()
+    if _raw_msg.startswith("/"):
+        _sr = _parse_slash(_raw_msg, user_id)
+        _kind = _sr["kind"]
+        if _kind == "skill":
+            # 把技能正文预置为 SystemMessage，并剥离命令前缀作为本轮任务
+            skill_system_msg = SystemMessage(content=_sr["skill_body"])
+            body = {**body, "message": _sr["task"]}
+        elif _kind == "compact":
+            _text = await _do_compact(_sr.get("prompt", ""), thread_id, user_id, body)
+            yield sse("meta", {"thread_id": thread_id, "model": llm.get("model") or "demo", "reasoning": False, "mode": llm.get("mode")})
+            yield sse("token", {"delta": _text})
+            yield sse("done", {})
+            return
+        elif _kind == "clear":
+            _cm = get_context_manager(user_id)
+            _n = _cm.clear(f"{user_id}:{thread_id}")
+            yield sse("meta", {"thread_id": thread_id, "model": llm.get("model") or "demo", "reasoning": False, "mode": llm.get("mode")})
+            yield sse("token", {"delta": f"已清空本会话上下文（移除 {_n} 条存储轮次）。"})
+            yield sse("done", {})
+            return
+        else:  # direct: /skills /help /unknown
+            yield sse("meta", {"thread_id": thread_id, "model": llm.get("model") or "demo", "reasoning": False, "mode": llm.get("mode")})
+            yield sse("token", {"delta": _sr["text"]})
+            yield sse("done", {})
+            return
+
     try:
         # 图编译（build_graph().compile()）是重 CPU 活；放到线程池执行，
         # 避免阻塞事件循环导致其他聊天请求被卡住（A1 性能修复）。
@@ -799,7 +1018,11 @@ async def _run_envelope_impl(thread_id: str, body: dict, user_id: str = "default
             "recursion_limit": 200,
         }
     else:
-        input_val = {"messages": [HumanMessage(content=body.get("message", ""))]}
+        _msgs = []
+        if skill_system_msg is not None:
+            _msgs.append(skill_system_msg)
+        _msgs.append(HumanMessage(content=body.get("message", "")))
+        input_val = {"messages": _msgs}
         # 会话索引：用于侧边栏 Sessions 面板（按用户隔离）
         _touch_session(thread_id, title=body.get("message", "")[:30], user_id=user_id)
         ck = _ckpt_thread(user_id, thread_id)

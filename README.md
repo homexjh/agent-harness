@@ -131,6 +131,25 @@ examples/             # run_minimal.py / run_stable.py / run_deepseek.py
 
 整个过程：模型调用与工具执行被 Governor 边界干净切分，门在 step 边界生效；多用户隔离在节点内按 `user_id` 现取 manager（§9.3），图本身按 `(model, mode)` 编译为全局单例。
 
+### 1.5 聊天斜杠命令（Slash Commands）★
+
+聊天消息以 `/` 开头时，后端在跑图之前先走命令路由（`app.py:_run_envelope_impl` → `_parse_slash`，均在 `app.py`），不进入 LLM。这是 QwenPaw 式的按需能力入口：
+
+| 命令 | 行为 | 实现 |
+|---|---|---|
+| `/skills` | 列出所有**已启用**技能（用户级 `~/.agent-harness/skills/<id>/SKILL.md` + 项目级 `<cwd>/.workbuddy/skills/<id>/SKILL.md`），每条给出 `/<id>` 调用方式 | `_render_skills_list` → 与 `GET /skills` 同款扫描（`plugins.py:456`） |
+| `/skill <id> <任务>` | 调用技能：把该技能 `SKILL.md` 正文作为 `SystemMessage` 预置到本轮输入，剥离命令前缀作为任务；技能在本会话内保持激活直到 `/clear` | `_resolve_skill_invocation` → 注入 `input_val` 的 `skill_system_msg` |
+| `/<id> <任务>` | 同上，直接以技能 id 调用（如 `/pdf-en 提取第 3 页`） | 同 `/skill` |
+| `/clear` | **真清空**本会话上下文（调用 `ContextManager.clear(user:thread)`，折叠区原文一并丢弃） | `get_context_manager(user_id).clear(...)`（同 `POST /context/clear`） |
+| `/compact [补充]` | 用**当前请求的模型**把本会话压缩为结构化摘要，清空后以单条 `HumanMessage("[对话摘要]…")` 写回基线 | `_do_compact` → `_make_model_for_request` 取模型 → LLM 总结 |
+| `/help` | 显示上述内置命令帮助 | `_render_help` |
+
+**关键事实**：
+- 技能为**按需调用**（on-demand），非后台常驻注入——符合 QwenPaw 的命令形态，也更省上下文。
+- 技能正文来自 `SKILL.md` 去掉 YAML frontmatter 后的部分；扫描/抽取逻辑与 `GET /skills` 共用同一套正则。
+- `/clear` 是真清空（区别于前端旧 `/clear` 仅 `newSession` 的假清）；若前端仍拦截 `/clear`，需把该命令改发往后端才能生效（见 §11 前端）。
+- `/compact` 需要已配置模型（请求体 `api_key` 或全局 `config.llm.api_key`），否则返回提示而非崩溃。
+
 ---
 
 ## 2. 模式系统（agentmode.py）
