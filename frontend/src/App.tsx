@@ -947,8 +947,15 @@ export default function App() {
         base_url: settings.baseUrl,
         provider: settings.provider,
       };
+      const isCompact = text.trim().toLowerCase().startsWith("/compact");
       try {
         await streamChat(`/api/chat/${sid}`, body, (ev) => handleEvent(ev, aiMsg.id));
+        if (isCompact) {
+          // /compact 已把后端上下文压缩为摘要；前端也把可见会话折叠成该摘要单条
+          setSessions((prev) =>
+            prev.map((s) => (s.id === sid ? { ...s, messages: s.messages.slice(-1) } : s))
+          );
+        }
       } catch (err: any) {
         updateMsg(aiMsg.id, (m) => ({ ...m, status: "error", error: err?.message || "发送失败" }));
       } finally {
@@ -2036,7 +2043,7 @@ function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: strin
   const [showSuggest, setShowSuggest] = useState(false);
   const [suggestIdx, setSuggestIdx] = useState(0);
   const [suggestions, setSuggestions] = useState<{ cmd: string; desc: string }[]>([]);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const skillsCache = useRef<string[] | null>(null);
 
   const SLASH_COMMANDS: { cmd: string; desc: string }[] = [
@@ -2105,7 +2112,7 @@ function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: strin
     requestAnimationFrame(() => inputRef.current?.focus());
   };
 
-  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (showSuggest && suggestions.length) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -2133,11 +2140,14 @@ function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: strin
         setShowSuggest(false);
         return;
       }
+    } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      // 多行输入：Enter = 换行，Cmd/Ctrl+Enter = 发送
+      e.preventDefault();
+      submit();
     }
-    if (e.key === "Enter") submit();
   };
 
-  const onChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const v = e.target.value;
     setInput(v);
     if (v.startsWith("/")) loadSkills();
@@ -2164,10 +2174,11 @@ function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: strin
           ))}
         </ul>
       )}
-      <input
+      <textarea
         ref={inputRef}
+        rows={1}
         value={input}
-        placeholder={streaming ? "AI 回复中，可继续输入下一条…" : "输入消息，回车发送…（输入 / 查看命令）"}
+        placeholder={streaming ? "AI 回复中，可继续输入下一条…" : "输入消息，Cmd/Ctrl+Enter 发送，Enter 换行…（输入 / 查看命令）"}
         onChange={onChange}
         onKeyDown={onKeyDown}
       />

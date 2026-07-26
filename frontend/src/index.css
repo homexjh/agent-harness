@@ -610,6 +610,23 @@ body {
 .composer input:focus {
   border-color: var(--accent);
 }
+.composer textarea {
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 11px 14px;
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+  resize: none;
+  min-height: 44px;
+  max-height: 160px;
+  line-height: 1.5;
+  overflow-y: auto;
+}
+.composer textarea:focus {
+  border-color: var(--accent);
+}
 .composer button {
   background: var(--accent);
   color: #fff;

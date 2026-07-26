@@ -165,6 +165,27 @@ examples/             # run_minimal.py / run_stable.py / run_deepseek.py
 - **mission 可选挂 `FileLoopGate`**：仅当 `opts["loop_dir"]` 存在时追加（`:136-137`），以磁盘状态文件做持久化循环真相源。
 - **`chat` 模式只读**：`_writes_long_term_memory(mode)`（`graph.py:74`）在 chat 下跳过 `auto_memory` 写（见 §6），避免闲聊产生副作用与响应阻塞。
 
+### 2.1 闲聊 vs 任务：双轨设计与区分
+
+harness 把「**闲聊 / 轻交流**」与「**任务 / 重执行**」拆成两条设计轨道，靠**模式选择**区分（不是自动分类）：聊天框 `/mode chat|coding|mission` 或顶部模式下拉。默认 `chat`（`get_mode` `agentmode.py:172` 兜底 chat）；要动手做事就切到 `coding` / `mission`。两条轨道从**系统提示、迭代预算、门集合、长期记忆写策略**四个维度分别设计：
+
+| 维度 | chat（闲聊） | coding（编码任务） | mission（任务驱动） |
+|---|---|---|---|
+| 系统提示 | `_CHAT_PROMPT`（`agentmode.py:60`）：定位「只读 + 联网」纯交流，不动手、不写文件、不跑命令、不定时；要这些时提示切模式 | `_CORE` + 编码规范（`agentmode.py:77`） | `_CORE` + 任务分解与 `MISSION COMPLETE` 收尾（`agentmode.py:85`） |
+| 迭代上限 `IterationGate` | 30 | 40 | 60（`agentmode.py:107/115/125`） |
+| Token 预算 `BudgetGate` | 300k | 300k | 500k |
+| 输出上限 | 额外受 `CHAT_MAX_TOKENS` 约束（`graph.py:350`），压短回复 | 无额外上限 | 无额外上限 |
+| 门集合 | `Iteration + DoomLoop + Budget`（最简，无 rubric/FileLoop/MissionGate） | 同上 +（原 `StandaloneRubricGate` 已移除） | `Iteration + Budget + MissionGate + DoomLoop`，`loop_dir` 存在时追加 `FileLoopGate`（`agentmode.py:123-138`） |
+| **长期记忆写** | **跳过 `auto_memory`**（只读，不污染、不阻塞） | 正常写 | 正常写 |
+| 工具倾向 | 可读取/检索/联网，但提示「写盘/命令/定时交编码·任务模式」 | 读/写/改文件 + 执行命令 | 全能力 + 可挂磁盘状态文件循环 |
+
+**为什么这样分（设计哲学）**：
+- **闲聊要「轻、快、不污染」**：所以 chat 砍掉所有写动作（`auto_memory` 是写、曾同步阻塞 context_node 数十秒，`graph.py:34,143-144`）与重门，输出也用 `CHAT_MAX_TOKENS` 压短（呼应 `_CHAT_PROMPT`「简短带过，几句话解决」）。闲聊内容绝不进长期记忆，下次新 thread 不会"认识你"是因为 chat 从不写——这是设计使然，不是 bug。
+- **任务要「稳、闭环、可验证」**：mission 给最大预算 + `MissionGate`（读 `prd.json` 完成标记，`MISSION_MARKERS`=`["MISSION COMPLETE","任务完成","TASK DONE","ALL DONE"]`）反过早收工，可选 `FileLoopGate` 以磁盘状态文件做持久化循环真相源（重启不丢进度）。
+- **共享 `_CORE` 行为契约**（`agentmode.py:34`，coding/mission 共用）：先动手再开口 / 闭环交付 / 自行纠错 / 诚实边界；并明确「问候、闲聊或明显无需工具的问题直接回答，不要调用工具」——即**任务模式也会先判断该不该用工具**，与 chat 的"纯交流"形成软硬两道分流。
+
+> 一句话：区分靠**用户选模式**；chat 是"只读轻交流轨"（不写记忆、低预算、短输出），coding/mission 是"动手执行轨"（写记忆、高预算、门更严、可挂持久循环）。
+
 ---
 
 ## 3. 模型层（models.py / reasoning_model.py / agent.py）
