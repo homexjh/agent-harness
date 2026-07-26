@@ -37,10 +37,11 @@ _MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ctx-mem
 
 # 对话轨（chat）单次生成的输出 token 上限。
 # 根因修复：agent-harness 此前对 chat 不设 max_tokens，模型闲聊时会无限铺陈
-# （曾出现「你是谁」吐 846 chunk / 107s）；QwenPaw 给每次对话调用注入 max_tokens，
-# 其日志显示闲聊输出被限制在 ~200-300 token。这里给 chat 设上限，既保留足够
-# 表达空间，又硬性阻止失控长文。coding / mission 不设上限（保持旧行为）。
-CHAT_MAX_TOKENS = 300
+# （曾出现「你是谁」吐 846 chunk / 107s）；故给 chat 加硬上限阻止失控长文。
+# 但 300 太低——实测正常问答模型要 ~800 token，300 会被 dashscope 在
+# finish_reason=length 处硬腰斩（句子半截、无句号）。1500 既能容纳绝大多数
+# 正常问答，又仍压制失控长文（最坏几秒而非 107s）。coding / mission 不设上限。
+CHAT_MAX_TOKENS = 1500
 
 
 def _log_memory_exception(fut):
