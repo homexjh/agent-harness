@@ -115,6 +115,22 @@ examples/             # run_minimal.py / run_stable.py / run_deepseek.py
 - **多用户隔离在节点内现取**：图按 `(model,mode)` 编译期缓存为全局单例，但记忆/上下文不能跨用户共享，故 `context_node` 内按 `config["configurable"]["user_id"]` 调 `get_context_manager/get_memory_manager`（`graph.py:90-99`）。
 - **`auto_memory` 走单线程后台 executor**：`mm.auto_memory` 调 LLM 提取事实并重建索引，同步执行会阻塞 context 节点数十秒，故 `_MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=1)` 异步提交（`graph.py:36`、`graph.py:148`）。
 
+### 1.4 一次完整回合的 harness 内容（数据流）
+把图跑起来后，单个用户回合（turn）在 harness 内部经历的内容流：
+
+1. **入口**：`POST /threads/{id}/runs/stream` → `app.py` 构造 `config["configurable"]={"thread_id": "user:tid", "user_id": ...}` → `graph.ainvoke({"messages":[HumanMessage]}, config)`（`app.py:1108-1130`）。
+2. **context 节点**：`ContextManager.prepare`（`manager.py:412`，§5.6）按当前 thread 重建 `TurnStore` 镜像、折叠超预算旧轮、可选剥离媒体/裁剪工具结果，产出 `prompt_messages` 窗口（原始 `messages` 不动，append-only 事件日志）。
+3. **agent 节点**：`AgentNode`（`agent.py:94`）用 `prompt_messages` 调底层 LLM，token 级流式、重试降级、`max_tokens` 仅 chat 注入；把 chunk 合并成 `AIMessage(tool_calls)`。
+4. **条件边**：有 `tool_calls` → approval/governor 路由；无 → governor 判 STOP。
+5. **approval 节点**（敏感工具）：触发 HITL，`PendingApproval` 入 `approvals.sqlite` + `hub.wait()` 阻塞原执行流（`graph.py:266`）；用户裁决 → `future.set_result` → 继续。
+6. **tools 节点**：执行工具，结果包 `ToolMessage`；超大结果经 `ToolResultStore` 外置落盘（§5 / §10.9）。
+7. **governor 节点**：跑全部 Loop Gates（§4），STOP/ASK/CONTINUE；CONTINUE 注续跑提示回到 agent。
+8. **落盘**：每 super-step 由 `AsyncSqliteSaver` 异步写 `checkpoints.sqlite`（复合键 `user:tid`），会话可恢复、可时间旅行（§10.3）。
+9. **流式外发**：`app.py` 的 SSE 自研信封把 token/reasoning/tool/approval/metrics 增量推前端（§10.2）；`KEEPALIVE` 保活防假死。
+10. **后台记忆**：非 chat 且满 `auto_memory_interval` 轮 → `_MEMORY_EXECUTOR` 后台写 `auto_memory`（§6）。
+
+整个过程：模型调用与工具执行被 Governor 边界干净切分，门在 step 边界生效；多用户隔离在节点内按 `user_id` 现取 manager（§9.3），图本身按 `(model, mode)` 编译为全局单例。
+
 ---
 
 ## 2. 模式系统（agentmode.py）
@@ -199,8 +215,8 @@ examples/             # run_minimal.py / run_stable.py / run_deepseek.py
 这是本项目的核心创新点之一：**fold-not-summarize（折叠而非摘要）**——原始消息全文落库永不丢失，超预算时从最旧往新折叠成占位桩，并提供 agent 显式 `recall` 还原全文的能力。
 
 ### 5.1 两层存储
-- **`TurnStore`（`store.py:18`）**：SQLite 写穿式持久化每个 thread 的原始消息全文（`schema` `store.py:36-45`，`seq` 1-based，`idx_turns_thread_seq` 索引）。`all(thread_id)` 返回 `[{seq, msg}, ...]` 按 seq 升序（`store.py:68`）。**`clear` 是真删除**（`store.py:88`），折叠原文一并丢失且不可 recall——文档需提示用户 clear 的不可逆性。
-- **`ContextManager`（`manager.py:90`）**：维护折叠窗口与召回能力，复用 `TurnStore` 作真相源。
+- **`TurnStore`（`store.py:18`）**：可文件持久化的写穿式 turn 库（`schema` `store.py:32-47`，`seq` 1-based，`idx_turns_thread_seq` 索引），`all(thread_id)` 返回 `[{seq, msg}, ...]` 按 seq 升序（`store.py:68`）。**关键事实**：当前集成下 `get_context_manager` 未传 `db_path`，故 `ContextManager` 始终以 `TurnStore(":memory:")` 运行（`manager.py:97,113`）——即**进程内内存库，进程退出即丢**。因此**逐字对话的真正持久真相源是 `checkpoints.sqlite`**（§10.9），TurnStore 只是本次进程内的折叠/召回工作镜像。`clear(thread_id)` 是真删除（`store.py:88`），内存库下即丢弃该 thread 的折叠原文且不可 recall。
+- **`ContextManager`（`manager.py:90`）**：维护折叠窗口与召回能力，复用 `TurnStore`（内存）作本次进程内的工作镜像；跨重启的还原依赖 checkpointer 重放的 `messages`。
 
 ### 5.2 构造参数即上下文预算（`manager.py:91-110`）
 | 参数 | 默认 | 含义 |
@@ -246,17 +262,30 @@ examples/             # run_minimal.py / run_stable.py / run_deepseek.py
 
 ---
 
-## 6. 长期语义记忆（server/memory.py）★
+## 6. 记忆系统（多层：工作 / 上下文 / 长期 / 核心文件）★
 
-与上下文窗口（§5）、核心文件 persona（§9）是**三层不同职责**的记忆架构：
+> **记忆 ≠ 只有长期记忆。** 本项目把"记忆"拆成职责清晰的多层，每层有独立的存储、写入时机与读取路径。分层是刻意的：上下文窗口负责"此刻在聊什么"，长期语义库负责"跨会话沉淀的事实"，核心文件负责"你是谁"，而工作/短期记忆是图 state 里随回合进出的活动窗口。
 
-| 层 | 模块 | 存储 | 写入时机 | 读取时机 |
+### 6.0 四层总览
+
+| 层 | 模块 | 存储位置 | 写入时机 | 读取时机 |
 |---|---|---|---|---|
-| 核心文件层 | `core_files.py` | 工作区 6 个 .md | 用户/agent 主动写 | 每次 `build_system_prompt`（priority 20） |
-| 上下文层 | `context/manager.py` + `store.py` | SQLite turns + 折叠桩 | 每轮写穿 | `prepare` 折叠；`recall` 还原 |
-| 长期语义层 | `memory.py` | markdown vault + `index.json` | `auto_memory`(非 chat)/`dream` | `memory_search` 注入提示 / agent 显式搜 |
+| **① 工作/短期记忆** | `state.py` `AgentState` | 进程内（图 state：`messages` + `prompt_messages`） | 每轮追加/替换 | 每轮 `agent_node` / `context_node` 直接用 |
+| **② 上下文层** | `context/manager.py` + `store.py` | `TurnStore`(内存镜像) + `checkpoints.sqlite`(真持久) | 每轮写穿 + 折叠桩 | `prepare` 折叠；`recall` 还原（§5） |
+| **③ 长期语义层** | `memory.py` | `DATA_HOME/{user}/memory_vault/`(markdown) + `index.json`(含 `embedding`) | `auto_memory`(非 chat)/`dream` | `memory_search` 注入提示 / agent 显式搜 |
+| **④ 核心文件层** | `core_files.py` | `DATA_HOME/workspace/*.md`（AGENTS/SOUL/PROFILE/…） | 用户/agent 主动写 | 每次 `build_system_prompt`（priority 20，§9.2） |
 
-### 6.1 保险库结构
+**写入触发链（一次非 chat 对话的典型生命周期）**：
+1. 用户发言 → `messages` 追加（① 工作记忆，append-only 事件日志）。
+2. `context_node` 折叠/召回 → `TurnStore` 镜像 + `checkpoints.sqlite` 落盘（②）；超预算旧轮变折叠桩，模型可 `recall(seq)` 还原。
+3. 每满 `auto_memory_interval`（默认 **5**，`config.py:198`）轮 → 后台线程 `auto_memory` 抽事实写 `daily/<date>.md` + 更新 `index.json`（③）。
+4. 每日 `dream_cron`（默认 `0 23 * * *`）→ `dream()` 整合进 `dream/interests.md`（③）。
+5. 用户/agent 经 API 或 BOOTSTRAP 写 PROFILE/AGENTS/SOUL/MEMORY.md（④），下次 `build_system_prompt` 即生效。
+6. 下次对话 `MemoryContributor` 调 `memory_search` 把 ③ 的相关片段注入系统提示；`WorkspacePromptFilesContributor` 注入 ④。
+
+各层互不替代：清 `TurnStore` 不丢长期记忆；改 PROFILE 不影响 vault；回退 checkpoint 只动 ①② 不碰 ③④。
+
+### 6.1 保险库结构（长期语义层）
 `DATA_HOME/{user_id}/memory_vault/`（`memory.py:315-317`）含三个子目录：`daily/`（auto_memory 写入的每日笔记）、`digest/`（摘要，预留）、`dream/`（整合记忆 `interests.md`）。
 
 **`index.json` 结构**（`memory.py:335-338`）：
@@ -278,7 +307,8 @@ examples/             # run_minimal.py / run_stable.py / run_deepseek.py
 只用标准库 `urllib` 打 OpenAI 兼容 `/embeddings` 接口（`memory.py:209-226`），支持 openai/dashscope/gemini/ollama 等 backend，带 LRU 缓存（`max_cache_size` 默认 3000，`memory.py:90`）。
 
 ### 6.4 写入时机与副作用
-- **`auto_memory`（`memory.py:600`）**：按 `auto_memory_interval`（默认 10，`memory.py:106`）逐 thread 计数，每满 N 轮写一次每日笔记；`_extract_facts`（`memory.py:621`）优先用 DeepSeek 抽取（无 key 时回退为"把用户陈述直接列要点"，`memory.py:646-650`）。**只在非 chat 模式触发**（见 §2 `_writes_long_term_memory`）。
+- **`auto_memory`（`memory.py:600`）**：按 `auto_memory_interval` 逐 thread 计数，每满 N 轮写一次每日笔记；`_extract_facts`（`memory.py:621`）优先用 DeepSeek 抽取（无 key 时回退为"把用户陈述直接列要点"，`memory.py:646-650`）。**只在非 chat 模式触发**（见 §2 `_writes_long_term_memory`）。
+- **默认值存在两层、且不一致（非显而易见）**：① 运行时实际生效默认是 **5**——`config.py:198` 在构造 `runtime.json` 的 `running.reme_light_memory_config` 时写死 `5`，前端 `App.tsx:415` / `Plugins.tsx` 也兜底 `?? 5`；② 但 pydantic schema 字段 `auto_memory_interval: int = 10`（`memory.py:106`）默认值却是 **10**。即：若某处直接 `ReMeLightMemoryConfig()` 而不走运行时注入，会得到 10；走正常服务路径则得到 5。**本文档 §6.0 取运行时生效值 5**。
 - **`dream`（`memory.py:684`）**：取最近 7 个 daily 笔记整合进 `dream/interests.md`。
 - **`memory_search`（`memory.py:586`）**：由 `MemoryContributor` 在系统提示管线中注入（§9）。
 - **配置单一事实源**：`runtime_memory_config`（`memory.py:150`）从 `runtime.json` 的 `running` 段构造；`memory_config.json` 仅作向后兼容镜像。
@@ -428,10 +458,32 @@ examples/             # run_minimal.py / run_stable.py / run_deepseek.py
 - **运行时热加载**（`save_config`，`config.py:435-460`）：**必须在持锁前先 `get_config()`**——否则非重入锁自死锁（`config.py:438-439`）。`masked()`（`config.py:318`）递归脱敏 `api_key` 与 `_token` 结尾字段。
 - **数据目录独立**（`config.py:35-45`）：全部运行时数据落到 `~/.agent-harness`，不再写入 IDE 数据目录；`migrate_from_workbuddy()`（`config.py:60-97`）幂等迁移白名单文件（含 `checkpoints.sqlite`、`approvals.sqlite`、`cron.json`）。
 
-### 10.5 定时任务 `scheduler.py`
-- **后台线程，不阻塞 LLM 主循环**（`scheduler.py:51`）：`BackgroundScheduler` 在独立后台线程跑，APScheduler 回调也在该线程执行。
-- **后台线程 → 主事件循环的桥梁**（`app.py:120-158`）：`_run_scheduled_agent` 用 `asyncio.run_coroutine_threadsafe` 把 `graph.ainvoke` 调度回主事件循环。
-- **触发器**：`_parse_cron_trigger`（`scheduler.py:225`，5/6 位 cron + 时区）；`_parse_run_at`（`scheduler.py:242`，ISO8601 → `DateTrigger`，优先标准库 `fromisoformat` 避免 dateutil 缺失）。`misfire_grace_time=3600`（`scheduler.py:366`）补跑宽限。`_record_run`（`scheduler.py:68`）仅保留最近 200 条历史；`_push_cron_inbox`（`scheduler.py:90`）投递收件箱。
+### 10.5 定时任务 / Cron（`scheduler.py`）
+
+把"定时跑一段 prompt 或一条 shell"做成**不阻塞交互式 LLM 主循环**的后台能力。
+
+- **调度器**：APScheduler `BackgroundScheduler`（`scheduler.py:14,51`）跑在**专用后台线程**；`start_scheduler()` 在 `app.py` 的 `lifespan` 内最先启动（`app.py:102`），随后 `_register_scheduler_agent_runner()`（`app.py:120-124`）捕获**主事件循环**句柄并注册 agent runner。
+- **触发器**：`_parse_cron_trigger`（`scheduler.py:225`）支持 **5/6 字段** cron（可带 `timezone`）；`_parse_run_at`（`scheduler.py:242`）把 ISO8601 解析成一次性 `DateTrigger`（优先标准库 `fromisoformat`，失败回退 `dateutil`）。**无 interval/repeat 支持**。`misfire_grace_time=3600`（`scheduler.py:366/453/660`）——停机/阻塞错过触发点后 1 小时内仍补跑。
+- **执行桥（不阻塞主循环）**：触发时 `_run_job`（`scheduler.py:146`）→ `task_type=="agent"` 走 `_run_agent_job` → 注册的 `_run_scheduled_agent`（`app.py:147`）用 `asyncio.run_coroutine_threadsafe(_agent_invoke(...), 主循环)` 把图执行**派回主事件循环**；`fut.result(timeout=300)` 只在**调度器后台线程**上阻塞（最多 300s）。图执行用隔离 `thread_id="cron-{job_id}"`、`user=SYSTEM_USER`（`app.py:152`），与交互式会话完全分离、不串上下文。
+- **历史 & 收件箱**：`_record_run`（`scheduler.py:68`）写 `cron_history.json` 的 `runs`，**仅留最近 200 条**；状态为 `success/failed/error/timeout`（一次性终态，无 running/skipped）。终态（success/failed）后经 `_push_cron_inbox`（`scheduler.py:90`）投递 `inbox_events.json`（`save_result_to_inbox` 默认 True）。
+- **内置 dream 任务**：`sync_memory_jobs`（`scheduler.py:627`）注册固定 id `ah-memory-dream`，按 `memory_config.dream_cron`（默认 `0 23 * * *`，`config.py:199`）每日跑 `_memory_dream_job`（`scheduler.py:597`）遍历各用户 vault 调 `dream()`；`PUT /memory/config` 改表达式后热重载。
+- **无 heartbeat 调度任务**：`GET /heartbeat`（`plugins.py:987`）是存活/资源探测接口，不是 APScheduler 任务。
+- **HTTP API（均在 `plugins.py`，前缀为空）**：
+
+  | 方法 | 路径 | 说明 |
+  |------|------|------|
+  | GET | `/cron` | 列表（含 `schedule_text`/`schedule_type`） |
+  | POST | `/cron` | 创建（body `CronJob`：`name`/`schedule`/`command`/`enabled`/`task_type("command"\|"agent")`/`prompt`/`timezone`/`run_at`/`save_result_to_inbox`） |
+  | DELETE | `/cron/{jid}` | 删除（并 `sync_jobs` 热载） |
+  | PATCH | `/cron/{jid}` | 启停（`{enabled:bool}`，即 pause/resume） |
+  | POST | `/cron/{jid}/run` | 立即运行 |
+  | GET | `/cron/history` | 全部历史 |
+  | GET | `/cron/{jid}/history` | 单任务历史 |
+  | GET | `/cron/{jid}/state` | 运行状态 |
+  | GET | `/cron/validate?schedule=` | 校验 cron 表达式 |
+
+  所有写操作后 `_cron_db().write_text(...)` + `sync_jobs()` 热加载，**无需重启**。一次性任务触发后自动从 `cron.json` 移除。
+- **持久化文件**：`DATA_HOME/cron.json`（任务定义 `{"jobs":[...]}`）+ `DATA_HOME/cron_history.json`（运行历史）。
 
 ### 10.6 其他服务端模块
 - **`plugins.py`**：聚合所有配件管理端点的 FastAPI Router（并非动态插件加载器），覆盖 Files/Tools/Skills/MCP/Agents/Cron/Heartbeat/Sessions/Memory/Context。会话索引 `sessions.json`（`plugins.py:1023`）结构 `{threads:{tid:{updated_at,title,user_id}}}`；多用户隔离列表只返回本 user 会话；`DELETE /sessions/{tid}` 用复合键 `user:tid` 清理 checkpoint。目录沙箱 `_safe_path`（`plugins.py:69`）防越界。
@@ -462,6 +514,35 @@ examples/             # run_minimal.py / run_stable.py / run_deepseek.py
 8. **图构建/模型探测专属线程池**：`_graph_build_executor`、`_discover_executor` 均隔离默认线程池，根因是同池抢占导致聊天请求偶发数十秒卡顿（`app.py:63-66`、`model_discovery.py:21-23`）。
 9. **inbox 原子写**：tmp + replace，避免并发/损坏。
 10. **token 统计零开销**：仅 `on_llm_end` 抓用量，daemon 线程落盘。
+
+### 10.9 数据存储与各种写入总览
+
+本项目所有持久数据落在 `DATA_HOME`（默认 `~/.agent-harness`，可用 `AGENT_DATA_HOME` 覆盖；`config.py:45`）。配置 `runtime.json` 在仓库内 `config/`（Fernet 加密）。下表是**全量写入清单**——每条都标了路径、技术、谁写、何时写、同步/异步、锁与原子性：
+
+| Store | 路径 | 技术 | 写入方 | 时机 | 同步/异步 | 锁/原子/持久 |
+|---|---|---|---|---|---|---|
+| **checkpoints.sqlite** | `DATA_HOME/checkpoints.sqlite` | SQLite **WAL** | LangGraph `AsyncSqliteSaver` | 每 super-step | **异步**(loop内) | `busy_timeout=30s`+WAL；`start.sh` 杀旧进程防竞争；复合键 `user:tid` |
+| **approvals.sqlite** | `DATA_HOME/approvals.sqlite` | SQLite(rollback) | `approval_hub` | 请求/决议/超时 | 同步 | `timeout=5`；跨 worker poller 每秒扫描 |
+| **TurnStore** | **内存 `:memory:`（无文件）** | 内存 SQLite | `ContextManager._sync_store` | 每轮 | 同步 | 进程退出即丢；**真持久真相源是 checkpoints.sqlite** |
+| **ToolResultStore** | `DATA_HOME/tool-results/<thread>/<tool>_<uuid>.txt` | 文本文件 | `ContextManager` 外置 | 超阈值(默认 50KB)时 | 同步 | 无锁，按 thread 隔离，防目录穿越 |
+| **memory_vault** | `DATA_HOME/{user}/memory_vault/{daily,digest,dream}/*` + `index.json` | markdown + JSON(含 `embedding`) | `auto_memory` / `dream` | 后台线程 / cron | 同步(后台线程) | `RLock`；`index.json` 直接写 |
+| **核心 persona .md** | `DATA_HOME/workspace/{AGENTS,SOUL,PROFILE,BOOTSTRAP,HEARTBEAT,MEMORY}.md` | markdown | 用户/agent 编辑 | 按需 | 同步 | 无锁 |
+| **sessions.json** | `DATA_HOME/sessions.json` | JSON | `_touch_session` | 建/更新/删会话 | 同步 | 直接写，**非原子**；key=原始 tid + `user_id` 字段 |
+| **cron.json** | `DATA_HOME/cron.json` | JSON | `/cron` API, `create_timer` | 增删改/触发后清理 | 同步 | 直接写，**非原子** |
+| **cron_history.json** | `DATA_HOME/cron_history.json` | JSON | 每次任务执行 | 任务运行 | 同步 | 仅留最近 200 条 |
+| **inbox_events.json** | `DATA_HOME/inbox_events.json` | JSON | scheduler / `append_event` | 后台任务结果 | 同步 | **原子 tmp+replace** + Lock，上限 5000 |
+| **token_usage.json** | `DATA_HOME/token_usage.json` | JSON | `TokenUsageCallbackHandler` | LLM 调用结束 | **daemon 线程** | Lock，上限 5000，非阻塞 |
+| **runtime.json** | `<repo>/config/runtime.json` | JSON(Fernet) | `save_config` | `POST /config` | 同步 | `chmod 600`；直接写 |
+| **配套状态 JSON** | `DATA_HOME/{tools_state,agents,skills_state,core_files_state,mcp,security,voice,envs,workspace-state,memory_config,context_config,core_files_config}.json` | JSON | 各管理路由 | 按需 | 同步 | 直接写，**非原子** |
+| **logs/agent-harness.log** | `<repo>/logs/` | 日志 | logging | 运行时 | 异步 handler | `RotatingFileHandler` |
+| **observability Metrics** | 内存 | — | — | — | — | **不持久化**（仅进程内计数器，`/metrics` 读 `snapshot()`） |
+
+**关键结论（写数据的人必须知道）**：
+1. **对话的持久真相源是 `checkpoints.sqlite`**，不是 `TurnStore`（后者内存镜像）。时间旅行/回滚都基于它（§10.3、§10.8）。
+2. **只有 `inbox_events.json` 做了原子 tmp+replace**；其余 JSON 多为直接 `write_text`，理论上存在并发读改写损坏的低概率风险（单进程串行请求下可接受）。
+3. **跨进程锁竞争只在 SQLite 层**：`checkpoints.sqlite`/`approvals.sqlite` 靠 WAL + `busy_timeout` + `start.sh` 启动前杀旧实例来缓解；JSON 无应用层跨进程锁。
+4. **`auto_memory` / `dream` 走后台线程**（不阻塞流式），`token_usage` 走 daemon 线程（零开销）；其余写入多在请求内同步完成。
+5. **首次迁移 `migrate_from_workbuddy`**（`config.py:60-97`）把旧 `~/.workbuddy` 的白名单文件（含 `checkpoints.sqlite`/`approvals.sqlite`/`cron.json`/`sessions.json`/各状态 JSON/记忆配置）幂等搬到 `DATA_HOME`，绝不碰 IDE 的 skills/binaries/traces。
 
 ---
 
