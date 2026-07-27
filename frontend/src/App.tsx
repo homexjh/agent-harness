@@ -2082,11 +2082,28 @@ function Composer({ streaming, onSend }: { streaming: boolean; onSend: (t: strin
   useEffect(() => { loadSkills(); }, []);
 
   const updateSuggestions = (val: string) => {
-    if (!val.startsWith("/") || val.includes(" ")) {
+    if (!val.startsWith("/")) {
       setShowSuggest(false);
       return;
     }
     const q = val.toLowerCase();
+    // `/skill`（不带 s）作为「技能选择器」：输入 /skill 即直接列出全部已启用技能，
+    // 其后空格后的词作为子串过滤（如 /skill pdf）；用户选中后自动填入 /<id>。
+    if (q === "/skill" || q.startsWith("/skill ")) {
+      const tail = q.slice("/skill".length).trim();
+      const list = (skillsCache.current || [])
+        .filter((s) => !tail || `${s.id} ${s.name} ${s.description}`.toLowerCase().includes(tail))
+        .map((s) => ({ cmd: "/" + s.id, desc: s.name ? `${s.name} — ${s.description}` : "技能命令" }));
+      setSuggestions(list);
+      setShowSuggest(list.length > 0);
+      setSuggestIdx(0);
+      return;
+    }
+    // 其余命令：含空格（已带任务词）则收起补全，避免干扰
+    if (val.includes(" ")) {
+      setShowSuggest(false);
+      return;
+    }
     const builtins = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q));
     let list = builtins;
     // 打 / 的瞬间即混入全部技能（带真实名称/描述），方便直接选择；随输入继续过滤
